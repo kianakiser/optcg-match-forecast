@@ -19,9 +19,10 @@ features, which is exactly the in-event leakage the `table` field was rejected f
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import date
+from itertools import groupby
 from typing import Any
 
 from optcg_forecast.features.cards import Card
@@ -197,27 +198,47 @@ class FeatureBuilder:
         # store wins for the lexicographically first archetype, so the key stays symmetric
         rec.wins += won if key[0] == p1_leader else 1 - won
 
-    def process_event(
+    def process_day(
         self,
         event_date: date,
-        matches: Iterable[Match],
-        leader_of: dict[str, str],
-        deck_of: dict[str, DeckSummary] | None = None,
+        events: Sequence[tuple[Iterable[Match], dict[str, str], dict[str, DeckSummary] | None]],
     ) -> list[FeatureRow]:
-        """Emit rows for one whole event, then learn from all of it.
+        """Emit rows for every event on one calendar date, then learn from all of them.
 
-        Two phases on purpose: emitting first means no match in this event can see any other
-        match in the same event.
+        The unit is the DAY, not the event, and that is the whole point of this method.
+
+        The source gives each event a date and no time. On 21 dates in the current corpus two or
+        more events share a date, covering 23,915 matches. Processing them one event at a time -
+        emit, learn, emit, learn - lets the second event of a day train on the first event's
+        results, and the order it happens to walk them in comes from the event id, which is not
+        chronological and carries no information about which tournament actually finished first.
+
+        That is leakage in the strict sense: 12,486 rows could see results the model would not
+        have had. It is also the quiet kind, because it inflates the score rather than breaking
+        anything, and an inflated score looks like success.
+
+        So the state a row sees is the state as of the START of its date, for every event on that
+        date, and the day's results are folded in only once all of them have been emitted. Within
+        a day the ordering question disappears, because no ordering is used.
         """
-        if self._last_date is not None and event_date < self._last_date:
+        if self._last_date is not None and event_date <= self._last_date:
             raise ValueError(
-                f"events must arrive in date order for point-in-time correctness: "
-                f"{event_date} came after {self._last_date}"
+                f"days must arrive in strictly increasing date order for point-in-time "
+                f"correctness, and each date exactly once: {event_date} came after "
+                f"{self._last_date}"
             )
         self._last_date = event_date
 
-        usable = [m for m in matches if leader_of.get(m.player1) and leader_of.get(m.player2)]
-        decks = deck_of or {}
+        prepared = [
+            (
+                [m for m in matches if leader_of.get(m.player1) and leader_of.get(m.player2)],
+                leader_of,
+                deck_of or {},
+            )
+            for matches, leader_of, deck_of in events
+        ]
+
+        # Emit everything first, from one shared snapshot of state.
         rows = [
             self.features_for(
                 m,
@@ -226,27 +247,56 @@ class FeatureBuilder:
                 decks.get(m.player1),
                 decks.get(m.player2),
             )
+            for usable, leader_of, decks in prepared
             for m in usable
         ]
-        for m in usable:
-            self.learn(m, leader_of[m.player1], leader_of[m.player2])
+        # Only then learn, from the whole day at once.
+        for usable, leader_of, _ in prepared:
+            for m in usable:
+                self.learn(m, leader_of[m.player1], leader_of[m.player2])
         return rows
+
+    def process_event(
+        self,
+        event_date: date,
+        matches: Iterable[Match],
+        leader_of: dict[str, str],
+        deck_of: dict[str, DeckSummary] | None = None,
+    ) -> list[FeatureRow]:
+        """One event that is the only event of its date.
+
+        A thin wrapper over process_day. Calling it twice for the same date raises, because that
+        is precisely the leak process_day exists to prevent - group the day's events and pass
+        them together instead.
+        """
+        return self.process_day(event_date, [(matches, leader_of, deck_of)])
 
 
 def build(
     events: Iterable[tuple[date, list[Entrant], list[Match]]],
     catalogue: dict[str, Card] | None = None,
+    builder: FeatureBuilder | None = None,
 ) -> Iterator[FeatureRow]:
-    """Walk events in date order and yield feature rows.
+    """Walk events in date order, a day at a time, and yield feature rows.
 
-    `events` must be sorted by date; process_event raises if it is not, because silently
-    accepting out-of-order events would reintroduce exactly the leakage this module prevents.
+    `events` must be sorted by date; process_day raises if it is not, because silently accepting
+    out-of-order events would reintroduce exactly the leakage this module prevents. Events
+    sharing a date are grouped and processed together - see process_day for why that matters.
+
+    Pass `builder` to keep the accumulated state after the walk. Serving needs it: the leader,
+    player and matchup records are the only place the model's inputs can come from at predict
+    time, and they are otherwise discarded here.
     """
-    builder = FeatureBuilder()
+    state = builder if builder is not None else FeatureBuilder()
     cat = catalogue or {}
-    for event_date, entrants, matches in events:
-        leader_of = {e.player: e.leader_id for e in entrants if e.leader_id}
-        deck_of = (
-            {e.player: summarise(e.decklist, cat) for e in entrants if e.decklist} if cat else {}
-        )
-        yield from builder.process_event(event_date, matches, leader_of, deck_of)
+    for event_date, group in groupby(events, key=lambda e: e[0]):
+        day = []
+        for _, entrants, matches in group:
+            leader_of = {e.player: e.leader_id for e in entrants if e.leader_id}
+            deck_of = (
+                {e.player: summarise(e.decklist, cat) for e in entrants if e.decklist}
+                if cat
+                else {}
+            )
+            day.append((matches, leader_of, deck_of))
+        yield from state.process_day(event_date, day)

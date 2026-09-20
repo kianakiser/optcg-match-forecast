@@ -142,16 +142,26 @@ def test_write_landing_partitions_by_month(tmp_path: Path):
 def test_a_quiet_day_is_a_success_not_a_failure(tmp_path, monkeypatch, caplog):
     """Roughly 40% of days add nothing. That must exit 0."""
     monkeypatch.setattr("optcg_forecast.features.run.LimitlessClient", lambda **kw: FakeClient([]))
-    rc = main(["--out-dir", str(tmp_path), "--dry-run"])
+    rc = main(
+        [
+            "--out-dir",
+            str(tmp_path / "landing"),
+            "--feature-root",
+            str(tmp_path / "features"),
+            "--dry-run",
+        ]
+    )
     assert rc == 0
 
 
 def test_one_bad_event_does_not_lose_the_run(tmp_path, monkeypatch):
     client = FakeClient(EVENTS, fail_on={"big1"})
     monkeypatch.setattr("optcg_forecast.features.run.LimitlessClient", lambda **kw: client)
-    rc = main(["--out-dir", str(tmp_path)])
+    rc = main(
+        ["--out-dir", str(tmp_path / "landing"), "--feature-root", str(tmp_path / "features")]
+    )
     assert rc == 0
-    assert already_ingested(tmp_path) == {"big2"}, "the healthy event must still land"
+    assert already_ingested(tmp_path / "landing") == {"big2"}, "the healthy event must still land"
 
 
 def test_unreachable_index_fails_loudly(tmp_path, monkeypatch):
@@ -160,7 +170,10 @@ def test_unreachable_index_fails_loudly(tmp_path, monkeypatch):
             raise ApiError("index unreachable")
 
     monkeypatch.setattr("optcg_forecast.features.run.LimitlessClient", lambda **kw: Dead([]))
-    assert main(["--out-dir", str(tmp_path)]) == 1
+    assert (
+        main(["--out-dir", str(tmp_path / "landing"), "--feature-root", str(tmp_path / "features")])
+        == 1
+    )
 
 
 def test_needs_no_credentials(tmp_path, monkeypatch):
@@ -170,15 +183,32 @@ def test_needs_no_credentials(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "optcg_forecast.features.run.LimitlessClient", lambda **kw: FakeClient(EVENTS)
     )
-    assert main(["--out-dir", str(tmp_path), "--dry-run"]) == 0
+    assert (
+        main(
+            [
+                "--out-dir",
+                str(tmp_path / "landing"),
+                "--feature-root",
+                str(tmp_path / "features"),
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
 
 
 def test_running_twice_ingests_nothing_the_second_time(tmp_path, monkeypatch):
     client = FakeClient(EVENTS)
     monkeypatch.setattr("optcg_forecast.features.run.LimitlessClient", lambda **kw: client)
-    assert main(["--out-dir", str(tmp_path)]) == 0
+    assert (
+        main(["--out-dir", str(tmp_path / "landing"), "--feature-root", str(tmp_path / "features")])
+        == 0
+    )
     first = len(client.fetched)
-    assert main(["--out-dir", str(tmp_path)]) == 0
+    assert (
+        main(["--out-dir", str(tmp_path / "landing"), "--feature-root", str(tmp_path / "features")])
+        == 0
+    )
     assert len(client.fetched) == first, "immutable events must not be refetched"
 
 
@@ -187,5 +217,7 @@ def test_dry_run_writes_nothing(tmp_path, monkeypatch, flag):
     monkeypatch.setattr(
         "optcg_forecast.features.run.LimitlessClient", lambda **kw: FakeClient(EVENTS)
     )
-    main(["--out-dir", str(tmp_path), flag])
-    assert already_ingested(tmp_path) == set()
+    main(
+        ["--out-dir", str(tmp_path / "landing"), "--feature-root", str(tmp_path / "features"), flag]
+    )
+    assert already_ingested(tmp_path / "landing") == set()

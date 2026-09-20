@@ -59,13 +59,26 @@ class FeatureStore:
 
     # ------------------------------------------------------------------ write
 
-    def write(self, rows: Sequence[FeatureRow]) -> list[Path]:
+    def write(self, rows: Sequence[FeatureRow], *, replace_all: bool = False) -> list[Path]:
         """Write rows, replacing any existing rows for the same events.
 
         Replacing rather than appending is what makes a retry safe: the same event ingested
         twice yields one copy, not two.
+
+        `replace_all` makes the store hold exactly these rows and nothing else, which is what a
+        full rebuild means and what the incremental path quietly does NOT do. Incrementally,
+        rows for events absent from `rows` are preserved - correct when adding one event, wrong
+        when rebuilding, because anything that got in and then vanished from the source stays
+        forever. Two synthetic events from a test fixture survived in this store for exactly
+        that reason, and were counted in published figures.
         """
         if not rows:
+            if replace_all:
+                raise ValueError(
+                    "refusing to replace the whole store with nothing - this is either a bug "
+                    "upstream or an empty landing zone, and silently emptying the store would "
+                    "hide both"
+                )
             log.info("no feature rows to write")
             return []
 
@@ -80,7 +93,7 @@ class FeatureStore:
 
             incoming_events = {r.event_id for r in month_rows}
             keep: list[dict[str, Any]] = []
-            if path.is_file():
+            if path.is_file() and not replace_all:
                 existing = pq.read_table(path).to_pylist()
                 keep = [r for r in existing if r.get("event_id") not in incoming_events]
                 if len(keep) != len(existing):
@@ -96,6 +109,14 @@ class FeatureStore:
             pq.write_table(pa.Table.from_pylist(records), path, compression="snappy")
             written.append(path)
             log.info("wrote %d row(s) to %s", len(records), path)
+
+        if replace_all:
+            for stale in sorted(self.base.glob("month=*")):
+                if stale / "part.parquet" not in written:
+                    log.warning("dropping stale partition %s: no rows in the rebuild", stale.name)
+                    for f in sorted(stale.iterdir()):
+                        f.unlink()
+                    stale.rmdir()
 
         self._write_manifest()
         return written

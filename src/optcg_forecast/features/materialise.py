@@ -67,6 +67,13 @@ def read_landing(landing: Path) -> Iterator[tuple[date, list[Entrant], list[Matc
         except json.JSONDecodeError:
             log.warning("skipping unreadable landing file %s", path)
             continue
+        # Not every .json under this tree is a landing record. A store manifest, an editor
+        # backup or a stray export would otherwise be treated as an event and take the whole
+        # rebuild down with a KeyError - which is exactly what happened the first time a test
+        # pointed the feature store at a directory inside the landing zone.
+        if not isinstance(record, dict) or not {"event_id", "event_date"} <= record.keys():
+            log.warning("skipping %s: not a landing record", path)
+            continue
         records.append(record)
 
     records.sort(key=lambda r: (str(r["event_date"]), str(r["event_id"])))
@@ -97,7 +104,9 @@ def materialise(
         events[0][0],
         events[-1][0],
     )
-    store.write(rows)
+    # replace_all, because this IS the full rebuild. Anything not derivable from the
+    # landing zone has no business being in the store.
+    store.write(rows, replace_all=True)
     return rows
 
 

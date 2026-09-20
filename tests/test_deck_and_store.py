@@ -182,3 +182,43 @@ def test_event_ids_lets_ingest_skip_what_is_already_stored(tmp_path: Path):
     s = FeatureStore(root=tmp_path)
     s.write([row(event_id="e1"), row(event_id="e2")])
     assert s.event_ids() == {"e1", "e2"}
+
+
+# ----------------------------------------------------- a rebuild must be a rebuild
+
+
+def test_replace_all_drops_events_the_rebuild_no_longer_has(tmp_path):
+    """The bug that let two test fixtures live in the real store for days.
+
+    The incremental path preserves rows for events the incoming batch does not mention, which is
+    right when adding one event and wrong when rebuilding: anything that got in and then vanished
+    from the source stays forever, and gets counted.
+    """
+    store = FeatureStore(root=tmp_path)
+    store.write([row("real1", date(2026, 3, 1)), row("fixture", date(2026, 3, 2))])
+    assert store.event_ids() == {"real1", "fixture"}
+
+    store.write([row("real1", date(2026, 3, 1))])  # incremental: fixture survives
+    assert store.event_ids() == {"real1", "fixture"}
+
+    store.write([row("real1", date(2026, 3, 1))], replace_all=True)
+    assert store.event_ids() == {"real1"}, "a rebuild must leave exactly what was rebuilt"
+
+
+def test_replace_all_removes_a_month_that_lost_all_its_events(tmp_path):
+    store = FeatureStore(root=tmp_path)
+    store.write([row("a", date(2026, 3, 1)), row("b", date(2026, 4, 1))])
+    assert {p.name for p in store.base.glob("month=*")} == {"month=2026-03", "month=2026-04"}
+
+    store.write([row("a", date(2026, 3, 1))], replace_all=True)
+    assert {p.name for p in store.base.glob("month=*")} == {"month=2026-03"}
+    assert store.event_ids() == {"a"}
+
+
+def test_replace_all_refuses_to_empty_the_store(tmp_path):
+    """An empty rebuild is a bug upstream, not an instruction to delete everything."""
+    store = FeatureStore(root=tmp_path)
+    store.write([row("a", date(2026, 3, 1))])
+    with pytest.raises(ValueError, match="refusing"):
+        store.write([], replace_all=True)
+    assert store.event_ids() == {"a"}
