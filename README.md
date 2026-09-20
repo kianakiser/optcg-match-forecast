@@ -6,7 +6,7 @@ Video link goes at the top. Every TODO must be gone by 2027-01-10.
 
 # optcg-match-forecast
 
-> Predicts the winner of individual swiss-round matches in online One Piece TCG tournaments,
+> Predicts the winner of individual swiss-round matches in competitive One Piece TCG tournaments,
 > from the two submitted decklists and each player's prior tournament history.
 
 <!-- MS4: unlisted YouTube / SWITCHtube link here. No video files in the repo. -->
@@ -35,25 +35,32 @@ question — and out of time the per-player strength term turns out to contribut
 lives in archetype-vs-archetype matchup cells.
 
 **The label is not derivable from the features.** It is the outcome of a game between two humans.
-Player 1 wins 50.56% of 28,942 decided swiss matches — a Wilson CI of [49.98%, 51.14%], so seat
+Player 1 wins 50.19% of 68,322 decided swiss matches — a Wilson CI of [49.82%, 50.57%], so seat
 position is not distinguishable from a coin flip and carries no free signal.
 
 **Success criterion.** Pooled **Brier ≤ 0.2490** against the coin-flip 0.2500, over ≥ 6 held-out
 28-day windows (≥ 8,000 matches), with the 95% event-cluster bootstrap CI on the skill excluding
 zero — plus calibration within 3 pp in every 5-pp favourite bucket with n ≥ 250.
 
-An out-of-time reproduction of the existing model reaches Brier **0.2465** (skill +0.0035, CI
-[+0.0023, +0.0047]) and **54.65%** accuracy. The edge is real but small — about 1.4% relative —
-and the criterion is set where six months of real history says it holds, not where a single good
-month says it could.
+**Current champion (`v1`, trained 2026-09-20).** Pooled over 6 held-out 28-day windows and 12,700
+out-of-time matches: Brier **0.2325**, accuracy **60.98%**, skill **+0.0175** with an event-cluster
+CI of **[+0.0152, +0.0202]**, worst calibration gap **1.7%**. It clears the criterion on every
+term.
+
+The comparison that matters is not against the coin flip but against the plain archetype matchup
+rate, which scores **0.2449** on the same matches. The model beats the simple thing it replaces,
+and the pipeline refuses to register a candidate that does not — see
+[`training/run.py`](src/optcg_forecast/training/run.py).
 
 ## Data
 
 | | |
 |---|---|
 | Source | Limitless TCG tournament API (`play.limitlesstcg.com/api`) — keyless, community-run |
-| Corpus (to 2026-09-18) | 198 events · 12,166 entrants · **11,575 with full 50-card decklists** (95.1%) |
-| Usable matches | **28,942** decided swiss matches; 6,010 of them round 1 |
+| Corpus (2024-09-07 to 2026-09-17) | 277 events · 25,206 entrants · **23,733 with full 50-card decklists** (94.2%) |
+| Usable matches | **68,322** decided swiss matches from 254 events; 11,685 of them round 1 |
+| Concentration | largest organiser is 34.0% of matches (61.4% of events) — down from 80.2% before the two-year backfill |
+| Leaders seen | 133 distinct |
 | Update | event-driven; new events are immutable once finished, so re-fetch by id is safe |
 
 Ingest is deliberately polite: finished events are cached permanently because they never change,
@@ -78,8 +85,8 @@ Two traps, both handled at the ingest boundary in
 2. **Selection on the outcome.** Players who drop out mid-event are **kept**. Dropping out is
    itself an outcome, and droppers win far fewer matches than finishers, so the obvious
    `WHERE placing IS NOT NULL` would condition the population on *finishing* and delete most of
-   the true negatives. Measured on the backfill: **5,411 of 12,166 entrants (44.5%) dropped**, and
-   **175 of them still received a placing** — so `drop IS NOT NULL` is the correct test, not
+   the true negatives. Measured on the backfill: **10,027 of 25,206 entrants (39.8%) dropped**, and
+   some of them still received a placing — so `drop IS NOT NULL` is the correct test, not
    `placing IS NULL`.
 
 3. **Top-cut brackets mislabelled as swiss.** Two events are pure single-elimination brackets

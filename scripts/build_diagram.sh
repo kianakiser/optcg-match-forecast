@@ -11,8 +11,8 @@ uv run python scripts/make_architecture_diagram.py \
   --training-sub "train · evaluate · register" \
   --inference-sub "load champion · predict" \
   --ui-sub "match forecast" \
-  --feature-store "Hopsworks" \
-  --model-registry "Hopsworks" \
+  --feature-store "versioned Parquet" \
+  --model-registry "versioned + aliases" \
   --feature-trigger "GitHub Actions (daily) · backfill" \
-  --training-trigger "scheduled / manual" \
+  --training-trigger "GitHub Actions (weekly)" \
   --inference-trigger "on demand (UI) / nightly"
