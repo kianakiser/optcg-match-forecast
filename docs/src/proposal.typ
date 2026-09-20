@@ -43,14 +43,19 @@ strictly earlier events. For competitive players and deck-builders.
 
 *Horizon.* One match, priced at pairing time and resolved within the hour it is played. The model is given only what is known before the first card is played — the
 two registered 50-card lists and both pilots' results at strictly earlier events — and predicts
-that match's outcome. It is served on demand through a web UI where a player
-enters two decks *and both players' Limitless handles*, and the same model is scored nightly
-against every match that resolved since the previous run. The handles are not optional garnish:
-pooled over six held-out windows the player-history terms are the signal (Brier 0.2314 with them,
-0.2441 without), and a deck-only model scores 0.2441 against 0.2452 for a plain matchup lookup —
-a difference our own promotion criterion would reject. Over the last six months 72.8% of pairings
-have prior history for both handles and 4.2% for neither; an unknown handle still gets an answer,
-flagged by `coverage`. The provider lists a tournament only once it has finished, so there is no in-progress
+that match's outcome. It is served on demand through a web UI that asks one model
+two questions, and is scored nightly against every match that resolved since the previous run.
+The *deck question* sets both pilots to average — how a pairing goes between evenly matched
+players, which is what the project is about — and scores Brier 0.2439 against 0.2447 for a plain
+matchup lookup, a gap of 0.0008 with 95% CI [−0.0016, −0.0001]. It is small, real, and enforced
+as its own promotion check, so the pilot terms can never carry the model past the baseline while
+the card signal contributes nothing. The *match question* adds both players' Limitless handles
+and reaches 0.2309; handles are optional, 72.8% of recent pairings have history for both, and an
+unknown handle still answers with `coverage` saying so. The two are reported separately because
+the pilot terms are not a correction to the deck estimate: on evenly matched pilots a model
+trained with them and served pilot-neutral scores 0.2432, and one that never saw them scores
+0.2432. Skill is real (split-half win-rate correlation +0.68 at 80 matches vs +0.04 shuffled) but
+it is a rating system, and saying so is more defensible than one blended headline. The provider lists a tournament only once it has finished, so there is no in-progress
 feed to predict against in real time; the honest framing is on-demand serving plus nightly scoring,
 not live in-tournament inference. The reported winner is the label and is not computable from any
 feature.

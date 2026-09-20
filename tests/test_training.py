@@ -28,10 +28,12 @@ from optcg_forecast.training.run import (
     MAX_CALIBRATION_Z,
     MAX_ECE,
     MIN_CALIBRATION_BUCKETS,
+    PILOT_FEATURES,
     SWAP,
     Evaluation,
     _copy_serving_state,
     baseline_cell_rate,
+    contract,
     evaluate_block,
     evaluate_rolling,
     fit,
@@ -256,6 +258,7 @@ def test_evaluation_reports_a_loss_against_the_baseline_honestly():
     ev = Evaluation(
         model_scores=score([0.5] * 10, [1, 0] * 5),
         cell_scores=score([0.6, 0.4] * 5, [1, 0] * 5),  # the simple baseline does better
+        deck_scores=score([0.5] * 10, [1, 0] * 5),
         skill_ci=(-0.01, 0.02),
         calibration=Calibration(ece=0.02, worst_gap=0.03, worst_z=1.1, buckets=4),
         windows=3,
@@ -504,3 +507,81 @@ def test_missing_serving_state_warns_rather_than_crashing(tmp_path, caplog):
             _Store(tmp_path), reg, "v1", [{"event_id": "e1", "event_date": "2026-01-01"}]
         )
     assert "no serving state" in caplog.text
+
+
+# --------------------------------------------- the deck question vs the pilot question
+
+
+def test_pilot_neutral_zeroes_only_the_pilot_features():
+    """The deck question is the same row with both pilots set to average."""
+    rows = make_rows(n_events=3, per_event=10)
+    for r in rows:
+        r["player_strength_diff"] = 0.3
+        r["experience_diff"] = 12.0
+    train, _ = final_holdout(make_rows())
+    model = fit(train, {"max_depth": 3, "max_iter": 50})
+
+    x_full, _, _ = to_matrix(rows)
+    x_deck, _, _ = to_matrix(
+        [{**r, "player_strength_diff": 0.0, "experience_diff": 0.0} for r in rows]
+    )
+    assert not np.allclose(x_full, x_deck), "the fixture must actually differ"
+
+    # pilot_neutral must equal passing the zeroed rows explicitly, and nothing else may change
+    assert predict(model, rows, pilot_neutral=True) == pytest.approx(
+        predict(model, [{**r, "player_strength_diff": 0.0, "experience_diff": 0.0} for r in rows])
+    )
+
+
+def test_the_two_questions_give_different_answers():
+    """If they did not, the pilot terms would be doing nothing and the split would be theatre."""
+    import random
+
+    rng = random.Random(3)
+    rows = []
+    for e in range(40):
+        for i in range(150):
+            # The pilot gap carries real signal here, so the model learns to use it.
+            pilot = rng.uniform(-0.3, 0.3)
+            deck = rng.uniform(-0.1, 0.1)
+            row = dict.fromkeys(FEATURES, 0.0)
+            row.update(
+                event_id=f"E{e:03d}",
+                event_date=START + timedelta(days=7 * e),
+                round=1 + i % 8,
+                p1_leader=f"L{i % 8}",
+                p2_leader=f"L{(i + 3) % 8}",
+                player_strength_diff=pilot,
+                leader_strength_diff=deck,
+                label_p1_won=int(rng.random() < 0.5 + 1.2 * pilot + 0.4 * deck),
+            )
+            rows.append(row)
+
+    train, held = final_holdout(rows)
+    model = fit(train, {"max_depth": 3, "learning_rate": 0.1, "max_iter": 120})
+    with_pilots = predict(model, held)
+    deck_only = predict(model, held, pilot_neutral=True)
+    assert max(abs(a - b) for a, b in zip(with_pilots, deck_only, strict=True)) > 0.01
+
+
+def test_pilot_features_are_named_and_real():
+    assert set(PILOT_FEATURES) <= set(FEATURES)
+    assert "cell_rate" not in PILOT_FEATURES, "the matchup rate is a card feature, not a pilot one"
+
+
+def test_the_deck_claim_has_its_own_contract_check():
+    """Without it, the pilot terms could carry the model past the baseline on their own."""
+    names = {c.name for c in contract(_ev(deck=0.24, cell=0.25), _ev(deck=0.24, cell=0.25))}
+    assert "deck answer beats the lookup" in names
+
+
+def _ev(deck: float, cell: float) -> Evaluation:
+    n = 12_574
+    return Evaluation(
+        model_scores=score([0.4] * n, [1, 0] * (n // 2)),
+        cell_scores=score([cell] * n, [1] * n),
+        deck_scores=score([deck] * n, [1] * n),
+        skill_ci=(0.01, 0.02),
+        calibration=Calibration(ece=0.01, worst_gap=0.02, worst_z=1.0, buckets=10),
+        windows=6,
+    )

@@ -50,28 +50,39 @@ nothing" and the signal lived in matchup cells. That was measured on a five-mont
 bug that let events share a date leak into each other, and it was wrong. The correction matters
 more than the number, because it changes the product: see below.
 
-**What that means for the UI, and what we decided.** A page where you pick two decks and get a
-probability cannot use player history, so it is the third row of that table: **0.2441 against
-0.2452 for a plain matchup lookup** — a difference the confidence intervals do not separate, and
-one this repository's own promotion contract would reject. A deck-only forecast is a lookup table
-with extra steps.
+**Two questions, one model.** The model is asked one of two things, and keeping them apart is
+the point:
 
-So the UI asks for **two decks and both players' Limitless handles.** That is a real cost: you
-have to know your opponent's username, and it only works for players who compete on Limitless.
-It buys the difference between a model worth serving and one that is not.
+- **The deck question** — both pilots set to average: *how does this deck pairing go between
+  evenly matched players?* This is what the project is about, and what a deck-builder wants.
+- **The match question** — with both players' Limitless handles: *who wins this specific game?*
 
-Measured on the corpus, restricted to the last six months because that is the population who
-would actually use it:
+| | Brier | accuracy |
+|---|---|---|
+| match question (decks + pilots) | 0.2309 | 61.7% |
+| **deck question** (pilots neutral) | **0.2439** | 56.6% |
+| plain matchup lookup | 0.2447 | 59.5% |
+| coin flip | 0.2500 | 50% |
 
-| | share of pairings |
-|---|---|
-| both handles have prior history | **72.8%** |
-| both have 5 or more prior matches | 69.7% |
-| neither has any history | 4.2% |
+The deck answer beats the lookup by 0.0008 Brier, 95% CI [−0.0016, −0.0001] — small, real, and
+enforced as its own promotion check so the pilot terms can never carry the model past the
+baseline while the card signal contributes nothing.
 
-Of the 1,162 players active since June 2026, 87.5% have five or more matches on record. Where a
-handle is unknown the request still answers, with the `coverage` flag saying so, because refusing
-is worse than an honest "no evidence for this player".
+**The pilot terms are not a correction to the deck estimate.** I assumed they were — that they
+controlled for "strong players pick strong decks" and cleaned up the matchup rate. Measured on
+evenly matched pilots, a model trained with them and served pilot-neutral scores 0.2432, and a
+model that never saw them scores 0.2432. Identical. They are an independent skill term sitting
+alongside the card signal, which is why the two questions are labelled separately rather than
+blended into one headline number.
+
+Skill itself is real: split-half correlation of a player's win rate is +0.40 at 20 matches,
++0.68 at 80, against +0.04 for shuffled outcomes. But it is skill, not card intelligence, and
+most of the gap between 0.2439 and 0.2309 is a rating system rather than anything about cards.
+Worth knowing that the same signal does *not* transfer to placings: of 702 players who ever
+finished top-5, only 26.4% did it twice.
+
+**Handles are optional.** Anyone can ask the deck question. Supplying handles adds the pilot
+term and says so.
 
 **The label is not derivable from the features.** It is the outcome of a game between two humans.
 The API's first-listed player wins 50.2% of 68,320 decided swiss matches, a Wilson CI that spans

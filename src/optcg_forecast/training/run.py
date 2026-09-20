@@ -100,6 +100,16 @@ SWAP: dict[str, str | tuple[str, str]] = {
     "p2_leader_games": ("swap", "p1_leader_games"),
 }
 
+# The two features that describe the people rather than the cards. They are separable on
+# purpose: zeroing them asks the model a different question - "between evenly matched pilots,
+# how does this deck pairing go?" - which is the question the project is actually about.
+#
+# They do NOT de-confound the deck estimate, which is what I assumed when adding them. Measured:
+# a model trained with them and served with them zeroed scores 0.2432 on evenly matched pilots,
+# and a model that never saw them scores 0.2432. Identical. They are an independent skill term
+# sitting alongside the card signal, not a correction to it.
+PILOT_FEATURES = ("player_strength_diff", "experience_diff")
+
 SEED = 42
 
 
@@ -147,6 +157,7 @@ def predict(
     rows: Sequence[dict[str, Any]],
     *,
     symmetrise: bool = True,
+    pilot_neutral: bool = False,
 ) -> list[float]:
     """P(the listed first player wins), independent of which player is listed first.
 
@@ -163,7 +174,14 @@ def predict(
     Averaging the model with its own mirror image makes antisymmetry hold by construction, for
     the price of one extra forward pass. Doing it here, in the one path both evaluation and
     serving use, is what stops the two disagreeing later.
+
+    `pilot_neutral` answers the deck question instead: both pilots set to average, so what comes
+    back is how the pairing goes between evenly matched players. One model answers both, because
+    a model trained with the pilot terms and served without them scores the same as one that
+    never saw them - so there is nothing to gain from training two.
     """
+    if pilot_neutral:
+        rows = [{**r, **dict.fromkeys(PILOT_FEATURES, 0.0)} for r in rows]
     x, _, _ = to_matrix(rows)
     p = model.predict_proba(x)[:, 1]
     if symmetrise:
@@ -187,6 +205,7 @@ class Evaluation:
 
     model_scores: Scores
     cell_scores: Scores
+    deck_scores: Scores
     skill_ci: tuple[float, float]
     calibration: Calibration
     windows: int
@@ -199,11 +218,23 @@ class Evaluation:
     def beats_cell_baseline(self) -> bool:
         return self.model_scores.brier < self.cell_scores.brier
 
+    @property
+    def deck_beats_cell_baseline(self) -> bool:
+        """The card-intelligence claim, on its own terms.
+
+        The full model beating the matchup rate proves little by itself, because the pilot terms
+        alone would carry it there. This asks whether the DECK answer - both pilots set to
+        average - still beats a plain lookup. If it does not, the project is a rating system
+        with a card-themed front end and should say so.
+        """
+        return self.deck_scores.brier < self.cell_scores.brier
+
     def summary(self) -> str:
         return (
             f"model {self.model_scores.summary()} | "
             f"matchup-only brier={self.cell_scores.brier:.4f} | "
             f"skill CI [{self.skill_ci[0]:+.4f}, {self.skill_ci[1]:+.4f}] | "
+            f"deck-only brier={self.deck_scores.brier:.4f} | "
             f"{self.calibration.summary()} | {self.windows} windows"
         )
 
@@ -256,6 +287,15 @@ def contract(rolling: Evaluation, gate: Evaluation) -> list[Check]:
             gate.beats_cell_baseline,
             f"{gate.model_scores.brier:.4f} vs {gate.cell_scores.brier:.4f} on the held-out gate",
         ),
+        # The one that keeps this project honest about what it is. Without it, the pilot terms
+        # could carry the model past the matchup baseline while the card signal contributed
+        # nothing, and the log would still read like a success.
+        Check(
+            "deck answer beats the lookup",
+            rolling.deck_beats_cell_baseline,
+            f"pilot-neutral {rolling.deck_scores.brier:.4f} vs lookup "
+            f"{rolling.cell_scores.brier:.4f} pooled",
+        ),
         Check(
             "skill interval clear of zero",
             low > 0,
@@ -289,6 +329,7 @@ def evaluate_rolling(
 ) -> Evaluation | None:
     """Walk forward, pooling every window's out-of-time predictions into one score."""
     probs: list[float] = []
+    decks: list[float] = []
     cells: list[float] = []
     labels: list[int] = []
     events: list[str] = []
@@ -298,6 +339,7 @@ def evaluate_rolling(
         assert_no_event_straddles(window.train, window.test)
         model = fit(window.train, params)
         probs.extend(predict(model, window.test))
+        decks.extend(predict(model, window.test, pilot_neutral=True))
         cells.extend(baseline_cell_rate(window.test))
         labels.extend(int(r["label_p1_won"]) for r in window.test)
         events.extend(str(r["event_id"]) for r in window.test)
@@ -311,6 +353,7 @@ def evaluate_rolling(
     return Evaluation(
         model_scores=score(probs, labels),
         cell_scores=score(cells, labels),
+        deck_scores=score(decks, labels),
         skill_ci=event_cluster_bootstrap(probs, labels, events, seed=SEED),
         calibration=assess_calibration(probs, labels),
         windows=windows,
@@ -326,11 +369,13 @@ def evaluate_block(
     assert_no_event_straddles(train, test)
     model = fit(train, params)
     probs = predict(model, test)
+    decks = predict(model, test, pilot_neutral=True)
     labels = [int(r["label_p1_won"]) for r in test]
     events = [str(r["event_id"]) for r in test]
     return Evaluation(
         model_scores=score(probs, labels),
         cell_scores=score(baseline_cell_rate(test), labels),
+        deck_scores=score(decks, labels),
         skill_ci=event_cluster_bootstrap(probs, labels, events, seed=SEED),
         calibration=assess_calibration(probs, labels),
         windows=1,
@@ -425,6 +470,10 @@ def run(
             "skill_ci_low": gate.skill_ci[0],
             "skill_ci_high": gate.skill_ci[1],
             "matchup_only_brier": gate.cell_scores.brier,
+            # The deck question, answered by the same model with both pilots set to average.
+            "deck_only_brier": gate.deck_scores.brier,
+            "deck_only_accuracy": gate.deck_scores.accuracy,
+            "contract_deck_only_brier": best.deck_scores.brier,
             "calibration_ece": gate.calibration.ece,
             "calibration_worst_gap": gate.calibration.worst_gap,
             "coin_brier": COIN_BRIER,
