@@ -17,6 +17,9 @@ Hochschule Luzern — HS26.
 
 ---
 
+**Live:** <https://optcg-forecast-508975903855.europe-west6.run.app> — no sign-in, scales to zero.
+`/version` says which model is answering; `/health` says whether one is loaded at all.
+
 ## What it predicts
 
 Given two registered decklists and both pilots' results at strictly earlier events, the system
@@ -166,7 +169,7 @@ Three decoupled pipelines — they never call each other, only the feature store
 |---|---|---|---|---|
 | 1 | **Feature** | GitHub Actions, daily + on-demand backfill | Limitless API | landing zone, then the feature store |
 | 2 | **Training** | GitHub Actions, weekly | feature store | model registry (on promotion only) |
-| 3 | **Inference** | on demand (UI) + nightly scoring | registry + feature store | predictions / UI |
+| 3 | **Inference** | on demand (UI) + nightly scoring | model registry (mounted from GCS) | predictions / UI, one JSON log line each |
 
 Regenerate the diagram after any stack change:
 
@@ -185,11 +188,6 @@ Regenerate the diagram after any stack change:
 | Serving | Google Cloud Run | container deploy, scales to zero between events |
 | Storage | GitHub Actions cache today, Google Cloud Storage next | the landing zone is the one durable artefact — immutable event payloads, from which the feature store is always rebuilt. The cache is honestly interim; see `notes/gcp_setup.md` |
 
-**Not built yet.** The inference pipeline is a design, not code: `src/optcg_forecast/inference/`
-is empty and the Dockerfile's entrypoint refers to a module that does not exist, so the image
-builds and will not start. It is listed in the table because the architecture is decided, not
-because it runs. See `notes/gcp_setup.md` for what it needs.
-
 **Stretch, explicitly optional:** drift monitoring on decklist composition and calibration
 dashboards. Core FTI ships first.
 
@@ -206,6 +204,7 @@ uv run python -m optcg_forecast.features.run                    # ingest, then r
 uv run python -m optcg_forecast.features.run --pages 5          # same path, walking back further
 uv run python -m optcg_forecast.features.materialise            # rebuild features, no API calls
 uv run python -m optcg_forecast.training.run                    # train, evaluate, maybe promote
+uv run --extra serve python -m optcg_forecast.inference.serve   # serve on http://localhost:8080
 ```
 
 Backfill runs through the **same** feature pipeline as live ingest — one code path, so a repaired
