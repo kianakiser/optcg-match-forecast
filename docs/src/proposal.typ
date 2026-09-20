@@ -68,13 +68,17 @@ existing archetype model out-of-time gives 0.2465; 0.2490 is the bar every six-w
 
 = 2 Originality & motivation
 
-#TODO[Kiana writes this one — "why this problem, and why you" is the graded question and it has
-to be yours. Raw material: you already built and run the data pipeline this draws on; the
-modelling question is separating deck strength from pilot skill, which is a real confounder
-rather than a leaderboard; and competitive TCG match forecasting appears on neither the
-mlops-lab.ch showcase nor the KTH ID2223 lists. Check both explicitly and say so.]
+#TODO[Kiana writes this — see notes/section2_worksheet.md. ~150 words, three things: why you
+(you already run this pipeline); why the problem (the published win rate conflates deck with
+pilot, and you can show the gap); and the checked-lists sentence. Both lists ARE checked:
+mlops-lab.ch FS26 has no card game, but KTH 2026 does have chess/NHL/football match predictors —
+so differentiate on structure, not on novelty.]
 
 = 3 Data source & features
+
+*Scope.* Training uses the full international online field. Swiss players are 4.0% of entrants
+(166 distinct players, 1,965 matches involving at least one), reported as a secondary evaluation
+slice rather than a training restriction: 525 Swiss-vs-Swiss matches would be far too few to fit.
 
 Matches come from Limitless (play.limitlesstcg.com) via its public JSON API: `/api/tournaments`,
 `{id}/standings`, `{id}/pairings` — no auth, no scraping. GitHub Actions ingests daily at 06:07
