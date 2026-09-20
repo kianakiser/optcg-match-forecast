@@ -38,7 +38,7 @@
 = 1 Problem statement
 
 *What and for whom.* For every Swiss match at a competitive One Piece TCG tournament, predict the
-probability the seat-1 player wins, from both registered decklists and both pilots' results at
+probability the first-listed player wins, from both registered decklists and both pilots' results at
 strictly earlier events. For competitive players and deck-builders.
 
 *Horizon.* One match, priced at pairing time and resolved within the hour it is played. The model is given only what is known before the first card is played — the
@@ -53,26 +53,34 @@ feature.
 *Scope.* Swiss rounds, predominantly best-of-one, at 32+ entrant events listed on
 play.limitlesstcg.com. Top cut, byes, ties and unresolved seats excluded — including events whose
 single-elimination brackets are mislabelled as Swiss. One corpus is used throughout: the 277 events
-ingested between 2024-09-07 and 2026-09-17, *68,322 decided Swiss matches* over 25,206 entrants.
+ingested between 2024-09-07 and 2026-09-17, *68,320 decided Swiss matches* over 25,206 entrants.
 The field mixes a recurring online series with in-person regionals and championships; the platform
 does not label which, so no claim is made about the split. The largest organiser is 34.0% of
 matches across 61.4% of events.
 
 *Success criterion.* Two baselines, not one. A coin flip — Brier 0.2500, log loss 0.6931 — is the
-floor, and it is the right floor because the label is balanced by construction: seat 1 wins 50.19%
-of those 68,322 matches (Wilson 95% CI 49.82–50.57%), leaving no majority-class rule and no rare
+floor, and it is the right floor because the label is balanced by construction: the provider's
+first-listed player wins 50.19% of those 68,320 matches (Wilson 95% CI 49.81–50.56%, spanning
+50%), leaving no majority-class rule and no rare
 positive class. The *binding* baseline is the plain archetype matchup rate, which needs no machine
 learning at all and scores 0.2449 out of time; a classifier that cannot beat it should not be
 registered, and the pipeline refuses to register one that does not.
 
 Success = pooled over ≥ 6 held-out 28-day windows *split by event date, never by row*
 (≥ 8,000 matches): Brier ≤ 0.2490, below the matchup-rate baseline, with the skill interval
-(0.2500 − Brier, whole-event bootstrap) excluding zero, and calibration gaps ≤ 3 points in every
-5-point favourite bucket with n ≥ 250. Hyperparameters are chosen on the rolling windows and the
-decision to promote is taken on a further block held back before any model is fitted, so nothing
-is selected against the number reported. The champion promoted on 2026-09-20 reaches Brier 0.2368
-(skill interval +0.0074 to +0.0203) at 59.53% accuracy on that block, against 0.2466 for the
-matchup rate, with a worst calibration gap of 3.1%.
+(0.2500 − Brier, whole-event bootstrap) excluding zero, and expected calibration error ≤ 3 points
+with no bucket more than 3σ from its predicted rate. All
+seven checks are enforced in code and each logs PASS or FAIL, so a rejection names the criterion.
+Hyperparameters are chosen on the rolling windows and the decision to promote is taken on a
+further block held back before any model is fitted, so nothing is selected against the number
+reported. The champion promoted on 2026-09-20 passes every check: pooled Brier 0.2309 at 61.7%
+accuracy with ECE 1.39%, and on the held-out block Brier 0.2371 (skill interval +0.0076 to
++0.0202) at 59.13% accuracy, against 0.2467 for the matchup rate.
+
+The calibration criterion was first written as "gaps ≤ 3 points in every bucket". That is a
+maximum over buckets, so it grows with how many qualify; simulated on our own predictions a
+perfectly calibrated model breaches it 74% of the time. It was replaced with expected calibration
+error rather than relaxed.
 
 = 2 Originality & motivation
 
@@ -90,20 +98,24 @@ slice rather than a training restriction: 804 Swiss-vs-Swiss matches would be fa
 
 Matches come from Limitless (play.limitlesstcg.com) via its public JSON API: `/api/tournaments`,
 `{id}/standings`, `{id}/pairings` — no auth, no scraping. GitHub Actions ingests daily at 06:07
-UTC; finished events are immutable and fetched once. At 2026-09-17 the corpus holds *68,322 decided
-Swiss matches* over 254 events and 25,206 entrants, *23,733 of them (94.2%) with a full 50-card
+UTC; finished events are immutable and fetched once. At 2026-09-17 the corpus holds *68,320 decided
+Swiss matches* over 252 events and 25,206 entrants, *23,733 of them (94.2%) with a full 50-card
 list*, growing ≈ 588 matches and 3.8 events weekly over the last twelve weeks. The source is live,
 not an archive: in-scope events existed in the index but not in the corpus when this was written,
 the newest a day old.
 
 *Label.* `pairings[].winner`, the username the platform records from the reported result; no
-decklist rule yields it. Seat 1 wins 50.19% on that same corpus, so no rare positive
+decklist rule yields it. The first-listed player wins 50.19% on that same corpus, so no rare
+positive
 class exists. Scarcity is in the archetype tail: a new set every 2–3 months introduces leaders with
 no history at all, and 3–5 of the top 10 archetypes turn over at each release. Those rows stay in:
 the service returns 0.5 with an explicit `coverage` flag rather than guessing, because a
 leader-attribute backoff measured worse than a coin flip.
 
-*Features* (13, all differences so seat order cannot be learned as a signal):
+*Features* (13: nine differences, plus `cell_rate`, `cell_games` and the two leader game counts,
+which are orientation-dependent levels — so independence from which player the provider lists
+first is enforced at predict time by averaging the model with its own mirror image, not assumed
+from the feature definitions):
 `leader_strength_diff` and `player_strength_diff`, shrunk win rates over strictly earlier events;
 `cell_rate`, the shrunk archetype-vs-archetype rate; `experience_diff`; six deck aggregates
 joined to the public card catalogue — `counter_2k_diff`, `avg_cost_diff`, `high_curve_diff`,

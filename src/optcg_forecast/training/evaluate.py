@@ -6,7 +6,8 @@ Three choices here are load-bearing and worth being able to defend.
 all of that away - 0.51 and 0.99 both count as "predicted a win". Brier and log loss reward being
 right about how confident to be. Accuracy is reported too, because it is what a person asks for.
 
-*The baseline is a coin flip, not the observed base rate.* Seat 1 wins 50.56% here, but the 95%
+*The baseline is a coin flip, not the observed base rate.* The provider's first-listed player
+wins 50.19% here, but the 95%
 interval on that includes 50, so quoting it would be baseline-shopping: claiming credit for a bias
 that may not exist.
 

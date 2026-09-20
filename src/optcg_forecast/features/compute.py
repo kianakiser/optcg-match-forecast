@@ -66,8 +66,12 @@ class FeatureRow:
     p1_leader: str
     p2_leader: str
 
-    # Differences, not levels: the model must not be able to learn "seat 1 is better",
-    # because it is not - seat 1 wins 50.56%, which is a coin flip.
+    # Differences, not levels, so the model cannot learn that the provider's first-listed
+    # player is better - they are not, that slot wins 50.19%, a coin flip. Note the slot is
+    # NOT the player who goes first: turn order is decided at the table (Tournament Rules
+    # Manual 4.6) and the API records no field for it. Four of the thirteen model inputs are
+    # not differences, so orientation independence is also enforced at predict time - see
+    # SWAP and predict() in training/run.py.
     leader_strength_diff: float
     player_strength_diff: float
     cell_rate: float

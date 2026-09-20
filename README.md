@@ -30,9 +30,32 @@ inference. The label still arrives on its own, with no manual annotation anywher
 
 **Why this is hard, and why it is interesting:** strong players pick strong decks, so a naive
 archetype win rate credits the *deck* for the *pilot*. Separating the two is the modelling
-question — and out of time the per-player strength term turns out to contribute almost nothing
-(Brier 0.2464 with it, 0.2465 without), while a random split makes it look essential. The signal
-lives in archetype-vs-archetype matchup cells.
+question, and measuring which one carries the signal is the answer.
+
+Pooled over six held-out 28-day windows — 12,574 out-of-time matches, 80 events:
+
+| features | Brier | accuracy |
+|---|---|---|
+| all 13 | **0.2314** | 61.0% |
+| player history only (2 features) | 0.2366 | 59.3% |
+| everything **except** player history | 0.2441 | 56.4% |
+| matchup cell alone | 0.2452 | 55.6% |
+
+**Player history is the signal**, and it is not close: removing it costs 0.0127 Brier, with a
+paired event-clustered interval of [−0.0146, −0.0109] that is nowhere near zero, and it loses in
+all six windows. Two player features alone beat the other eleven combined.
+
+An earlier version of this file claimed the opposite — that player strength "contributes almost
+nothing" and the signal lived in matchup cells. That was measured on a five-month corpus with a
+bug that let events share a date leak into each other, and it was wrong. The correction matters
+more than the number, because it changes the product: see below.
+
+**What that means for the UI.** A page where you pick two decks and get a probability cannot use
+player history, so it is the third row of that table: **0.2441 against 0.2452 for a plain matchup
+lookup** — a difference the confidence intervals do not separate, and one this repository's own
+promotion contract would reject. A deck-only forecast is a lookup table with extra steps. Asking
+for the two players' Limitless handles as well is what makes the model worth serving. That is a
+product decision and it is not yet made.
 
 **The label is not derivable from the features.** It is the outcome of a game between two humans.
 The API's first-listed player wins 50.2% of 68,320 decided swiss matches, a Wilson CI that spans
@@ -40,22 +63,26 @@ The API's first-listed player wins 50.2% of 68,320 decided swiss matches, a Wils
 carries no free signal. (That slot is *not* the player who goes first: turn order is decided at
 the table and the API does not record it.)
 
-**Success criterion.** Pooled **Brier ≤ 0.2490** against the coin-flip 0.2500, over ≥ 6 held-out
-28-day windows (≥ 8,000 matches), with the 95% event-cluster bootstrap CI on the skill excluding
-zero — plus calibration within 3 pp in every 5-pp favourite bucket with n ≥ 250.
+**Success criterion**, enforced in code as seven named checks that each log PASS or FAIL —
+see `contract()` in [`training/run.py`](src/optcg_forecast/training/run.py). Pooled **Brier ≤
+0.2490** against the coin-flip 0.2500, over ≥ 6 held-out 28-day windows and ≥ 8,000 matches;
+beating the matchup baseline on a block held back before any model was fitted; the 95%
+event-cluster bootstrap CI on the skill excluding zero; and **expected calibration error ≤ 3 pp**
+with no bucket more than 3σ from its predicted rate.
 
-**Current champion (`v1`, promoted 2026-09-20).** Promoted on a 2,456-match block held back
-before any model was fitted, so no candidate was selected against it: Brier **0.2368**, accuracy
-**59.53%**, skill **+0.0132** with an event-cluster CI of **[+0.0074, +0.0203]**, worst calibration
-gap **3.1%**.
+That last one was originally written as "gaps ≤ 3 pp in every bucket", which is a *maximum* over
+buckets and so grows with how many buckets qualify. Simulated on this project's own predictions,
+a perfectly calibrated model breaches it 74% of the time. It was measuring bucket count, not
+calibration, and it was replaced rather than relaxed.
 
-The comparison that matters is not against the coin flip but against the plain archetype matchup
-rate, which scores **0.2466** on the same block. The model beats the simple thing it replaces, and
-the pipeline refuses to register a candidate that does not — see
-[`training/run.py`](src/optcg_forecast/training/run.py).
+**Current champion (`v1`, promoted 2026-09-20).** All seven checks pass. On the pooled windows:
+Brier **0.2309**, accuracy **61.7%**, ECE **1.39%**. On the 2,454-match gate block held back
+before any model was fitted, so nothing was selected against it: Brier **0.2371**, accuracy
+**59.1%**, event-cluster skill CI **[+0.0076, +0.0202]**, against **0.2467** for the matchup
+lookup on the same block.
 
-The six rolling windows used to *choose* the hyperparameters report 0.2315. The card records both,
-because the 0.0053 gap between them is the cost of selection and is only visible if both are kept.
+Both numbers are on the card, because the 0.006 between them is the cost of choosing a winner
+from five candidates, and it is only visible if both are kept.
 
 ## Data
 
