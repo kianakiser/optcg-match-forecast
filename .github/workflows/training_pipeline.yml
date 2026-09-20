@@ -1,0 +1,102 @@
+# Scheduled training pipeline — MS3.
+#
+# Separate from the feature pipeline on purpose. They run on different clocks for different
+# reasons: features must be ingested daily because a finished tournament is only available after
+# it ends, while retraining weekly is enough because the metagame does not move faster than that
+# and a model retrained on four new events is a model retrained on noise.
+#
+# Decoupling them is the F-T-I architecture doing its job. This job never calls the API and never
+# computes a feature; it reads the store, and everything it needs is already there.
+
+name: Training pipeline
+
+on:
+  schedule:
+    # Mondays 05:41 UTC. After the weekend's events have been ingested by the Sunday and Monday
+    # feature runs, and off the top of the hour where GitHub is most likely to skip a run.
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      promote:
+        description: "Move the champion alias if the candidate wins (uncheck for a rehearsal)."
+        required: false
+        default: true
+        type: boolean
+      max_windows:
+        description: "Rolling-origin windows to evaluate over."
+        required: false
+        default: "6"
+        type: string
+
+concurrency:
+  group: training-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # The landing zone is the durable artefact: immutable event payloads, a few tens of MB.
+      # The feature store is derived from it and is rebuilt here, so only one thing needs
+      # persisting. This is an interim measure — see notes/deployment_decision.md — and moves to
+      # a GCS bucket once the cloud account exists, which is a change of root path and nothing
+      # else.
+      - name: Restore the landing zone
+        uses: actions/cache/restore@v4
+        with:
+          path: data/landing
+          key: landing-${{ github.run_id }}
+          restore-keys: landing-
+
+      - name: Rebuild the feature store
+        run: uv run python -m optcg_forecast.features.materialise
+
+      # Models are restored so the run can compare against the incumbent champion, and saved so
+      # the next run can. A first run with no cache simply has no champion to beat, which the
+      # pipeline handles.
+      - name: Restore the model registry
+        uses: actions/cache/restore@v4
+        with:
+          path: data/models
+          key: models-${{ github.run_id }}
+          restore-keys: models-
+
+      - name: Train, evaluate and decide
+        run: |
+          uv run python -m optcg_forecast.training.run \
+            --max-windows "${{ inputs.max_windows || 6 }}" \
+            ${{ inputs.promote == false && '--no-promote' || '' }}
+
+      - name: Save the model registry
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/models
+          key: models-${{ github.run_id }}
+
+      # The report is the deliverable a human reads. Kept for 90 days so a run's decision can be
+      # audited later: which model, on what metrics, against which incumbent.
+      - name: Upload the model cards
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-registry-${{ github.run_id }}
+          path: |
+            data/models/**/card.json
+            data/models/aliases.json
+          if-no-files-found: warn
+          retention-days: 90

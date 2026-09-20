@@ -51,6 +51,19 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
+      # Without this the job ingests happily into the runner's disk and throws it away when the
+      # job ends, so every run starts from nothing and re-fetches fourteen months of events —
+      # which the API's rate limit will not allow. The landing zone is the one thing that has to
+      # survive; the feature store is rebuilt from it every run. Interim until the GCS bucket
+      # exists (see notes/deployment_decision.md): a cache entry is immutable, so each run
+      # restores the newest by prefix and saves a new one under the run id.
+      - name: Restore the landing zone
+        uses: actions/cache/restore@v4
+        with:
+          path: data/landing
+          key: landing-${{ github.run_id }}
+          restore-keys: landing-
+
       - name: Run feature pipeline
         # No secrets here on purpose: the tournament endpoints this stage uses are keyless,
         # so a scheduled run needs no credentials at all. Requiring one would make the job
@@ -58,8 +71,25 @@ jobs:
         run: |
           if [ -n "${{ inputs.backfill_start }}" ]; then
             uv run python -m optcg_forecast.features.run \
-              --limit 400 --min-players "${{ inputs.min_players || 32 }}"
+              --limit 400 --pages 5 --min-players "${{ inputs.min_players || 32 }}"
           else
             uv run python -m optcg_forecast.features.run \
               --min-players "${{ inputs.min_players || 32 }}"
           fi
+
+      - name: Save the landing zone
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/landing
+          key: landing-${{ github.run_id }}
+
+      - name: Report what the store holds
+        run: |
+          echo "### Feature store" >> "$GITHUB_STEP_SUMMARY"
+          uv run python -c "
+          from optcg_forecast.features.store import FeatureStore
+          m = FeatureStore().manifest()
+          print('| metric | value |'); print('|---|---|')
+          for k, v in sorted(m.items()): print(f'| {k} | {v} |')
+          " >> "$GITHUB_STEP_SUMMARY"

@@ -4,10 +4,13 @@ This is the entry point the scheduled GitHub Actions workflow calls. It is delib
 smallest thing that genuinely works end to end, because a scheduled job that fails is worse
 than no scheduled job: it accumulates red runs on a public repository that reviewers clone.
 
-What it does today: ask the tournament index what exists, work out which events are new,
-fetch each one once, push it through the ingest boundary, and write the resulting rows to a
-local landing directory. What it does not do yet: write to the feature store (MS2) or compute
-model features. Those arrive in later milestones and plug in at the marked seam.
+What it does: ask the tournament index what exists, work out which events are new, fetch each
+one once, push it through the ingest boundary, write the clean rows to a landing directory, and
+then rebuild the feature store from that landing zone.
+
+Two stages, on purpose. Ingest talks to a rate-limited API and its output is immutable. The
+feature stage is pure computation over files already on disk, so changing a feature definition
+costs a rerun over cached data rather than a fresh fourteen-month crawl.
 
 Two properties matter more than the feature set and are worth keeping:
 
@@ -28,7 +31,7 @@ import sys
 from collections.abc import Iterable
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from optcg_forecast.common.config import load_settings, redacted
 from optcg_forecast.features.client import ApiError, LimitlessClient
@@ -38,6 +41,8 @@ from optcg_forecast.features.ingest import (
     entrant_rows,
     match_rows,
 )
+from optcg_forecast.features.materialise import materialise
+from optcg_forecast.features.store import FeatureStore
 
 log = logging.getLogger("optcg_forecast.features.run")
 
@@ -45,6 +50,16 @@ log = logging.getLogger("optcg_forecast.features.run")
 # Lowering it is the cheapest way to reduce single-organiser concentration - see
 # notes/domain_analysis.md - so it is a flag rather than a constant.
 DEFAULT_MIN_PLAYERS = 32
+
+
+class PayloadSource(Protocol):
+    """The only thing ingest_event needs from a client.
+
+    Narrower than the client on purpose: it says exactly what this function depends on, and it
+    lets a test pass a stub without a live API or a subclass that inherits a rate limiter.
+    """
+
+    def event_payload(self, event_id: str) -> dict[str, Any]: ...
 
 
 def _event_date(event: dict[str, Any]) -> date | None:
@@ -58,10 +73,27 @@ def _event_date(event: dict[str, Any]) -> date | None:
 
 
 def discover(
-    client: LimitlessClient, *, min_players: int, limit: int, already_have: set[str]
+    client: LimitlessClient,
+    *,
+    min_players: int,
+    limit: int,
+    already_have: set[str],
+    pages: int = 1,
 ) -> list[dict[str, Any]]:
-    """Return in-scope events from the index that have not been ingested yet."""
-    index = client.tournaments(limit=limit)
+    """Return in-scope events from the index that have not been ingested yet.
+
+    The index is newest-first and paged. A daily run needs page one and nothing else; a backfill
+    needs to walk back through history, which is what `pages` is for. One page of 400 covers
+    roughly five months, so the whole usable history is a handful of pages - cheap, and done
+    once.
+    """
+    index: list[dict[str, Any]] = []
+    for page in range(1, max(1, pages) + 1):
+        batch = client.tournaments(limit=limit, page=page)
+        if not batch:
+            break  # ran off the end of the index
+        index.extend(batch)
+
     fresh = []
     for event in index:
         if not event.get("id") or event["id"] in already_have:
@@ -78,7 +110,7 @@ def discover(
 
 
 def ingest_event(
-    client: LimitlessClient, event: dict[str, Any], stats: IngestStats
+    client: PayloadSource, event: dict[str, Any], stats: IngestStats
 ) -> dict[str, Any]:
     """Fetch one event and push it through the ingest boundary."""
     event_id = str(event["id"])
@@ -117,7 +149,16 @@ def already_ingested(out_dir: Path) -> set[str]:
     return {p.stem for p in out_dir.rglob("*.json")}
 
 
-def run(*, min_players: int, limit: int, out_dir: Path, dry_run: bool) -> int:
+def run(
+    *,
+    min_players: int,
+    limit: int,
+    out_dir: Path,
+    dry_run: bool,
+    feature_root: Path,
+    skip_features: bool = False,
+    pages: int = 1,
+) -> int:
     settings = load_settings()
     log.info("settings: %s", redacted(settings))
 
@@ -130,7 +171,9 @@ def run(*, min_players: int, limit: int, out_dir: Path, dry_run: bool) -> int:
     log.info("%d event(s) already in the landing zone", len(have))
 
     try:
-        fresh = discover(client, min_players=min_players, limit=limit, already_have=have)
+        fresh = discover(
+            client, min_players=min_players, limit=limit, already_have=have, pages=pages
+        )
     except ApiError as exc:
         log.error("could not reach the tournament index: %s", exc)
         return 1
@@ -138,8 +181,8 @@ def run(*, min_players: int, limit: int, out_dir: Path, dry_run: bool) -> int:
     if not fresh:
         # The normal case on most days: the source is bursty and roughly 40% of days add
         # nothing. Nothing to do is a success, not a failure.
-        log.info("no new in-scope events; nothing to do")
-        return 0
+        log.info("no new in-scope events; nothing to ingest")
+        return 0 if skip_features else _materialise(out_dir, feature_root, dry_run)
 
     log.info("%d new in-scope event(s) to ingest", len(fresh))
     stats = IngestStats()
@@ -160,6 +203,25 @@ def run(*, min_players: int, limit: int, out_dir: Path, dry_run: bool) -> int:
 
     log.info("ingested %d event(s); %s", written, stats.as_dict())
     log.info("api requests: %d, cache hits: %d", client.requests_made, client.cache_hits)
+    return 0 if skip_features else _materialise(out_dir, feature_root, dry_run)
+
+
+def _materialise(landing: Path, feature_root: Path, dry_run: bool) -> int:
+    """Rebuild the feature store from the landing zone.
+
+    A failure here must be loud. A silently stale feature store is the worst outcome available:
+    the pipeline reports success, training reads last month's features, and nothing looks wrong
+    until the model is worse and nobody knows why.
+    """
+    if dry_run:
+        log.info("dry run: would rebuild the feature store at %s", feature_root)
+        return 0
+    try:
+        rows = materialise(landing, FeatureStore(root=feature_root))
+    except Exception:
+        log.exception("feature materialisation failed; the store may be stale")
+        return 1
+    log.info("feature store holds %d row(s)", len(rows))
     return 0
 
 
@@ -167,7 +229,14 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--min-players", type=int, default=DEFAULT_MIN_PLAYERS)
     parser.add_argument("--limit", type=int, default=100, help="index page size to scan")
+    parser.add_argument(
+        "--pages", type=int, default=1, help="index pages to walk back through (backfill)"
+    )
     parser.add_argument("--out-dir", type=Path, default=Path("data/landing"))
+    parser.add_argument("--feature-root", type=Path, default=Path("data/features"))
+    parser.add_argument(
+        "--skip-features", action="store_true", help="ingest only; leave the feature store alone"
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -181,6 +250,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         limit=args.limit,
         out_dir=args.out_dir,
         dry_run=args.dry_run,
+        feature_root=args.feature_root,
+        skip_features=args.skip_features,
+        pages=args.pages,
     )
 
 
