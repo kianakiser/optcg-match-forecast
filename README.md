@@ -50,12 +50,28 @@ nothing" and the signal lived in matchup cells. That was measured on a five-mont
 bug that let events share a date leak into each other, and it was wrong. The correction matters
 more than the number, because it changes the product: see below.
 
-**What that means for the UI.** A page where you pick two decks and get a probability cannot use
-player history, so it is the third row of that table: **0.2441 against 0.2452 for a plain matchup
-lookup** — a difference the confidence intervals do not separate, and one this repository's own
-promotion contract would reject. A deck-only forecast is a lookup table with extra steps. Asking
-for the two players' Limitless handles as well is what makes the model worth serving. That is a
-product decision and it is not yet made.
+**What that means for the UI, and what we decided.** A page where you pick two decks and get a
+probability cannot use player history, so it is the third row of that table: **0.2441 against
+0.2452 for a plain matchup lookup** — a difference the confidence intervals do not separate, and
+one this repository's own promotion contract would reject. A deck-only forecast is a lookup table
+with extra steps.
+
+So the UI asks for **two decks and both players' Limitless handles.** That is a real cost: you
+have to know your opponent's username, and it only works for players who compete on Limitless.
+It buys the difference between a model worth serving and one that is not.
+
+Measured on the corpus, restricted to the last six months because that is the population who
+would actually use it:
+
+| | share of pairings |
+|---|---|
+| both handles have prior history | **72.8%** |
+| both have 5 or more prior matches | 69.7% |
+| neither has any history | 4.2% |
+
+Of the 1,162 players active since June 2026, 87.5% have five or more matches on record. Where a
+handle is unknown the request still answers, with the `coverage` flag saying so, because refusing
+is worse than an honest "no evidence for this player".
 
 **The label is not derivable from the features.** It is the outcome of a game between two humans.
 The API's first-listed player wins 50.2% of 68,320 decided swiss matches, a Wilson CI that spans

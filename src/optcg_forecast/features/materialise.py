@@ -23,8 +23,9 @@ from pathlib import Path
 from typing import Any
 
 from optcg_forecast.features.cards import Card, CardCatalogue
-from optcg_forecast.features.compute import FeatureRow, build
+from optcg_forecast.features.compute import FeatureBuilder, FeatureRow, build
 from optcg_forecast.features.ingest import Entrant, Match
+from optcg_forecast.features.serving_state import STATE_FILE, stamp_for, write_state
 from optcg_forecast.features.store import FeatureStore
 
 log = logging.getLogger(__name__)
@@ -96,7 +97,12 @@ def materialise(
         log.warning("landing zone %s is empty; nothing to materialise", landing)
         return []
 
-    rows = list(build(iter(events), cat))
+    # Hold the builder rather than letting build() construct and discard one: the leader,
+    # player and matchup records it accumulates are the only place a prediction's inputs can
+    # come from, and the feature store deliberately keeps no player identifiers to rebuild
+    # them from later.
+    builder = FeatureBuilder()
+    rows = list(build(iter(events), cat, builder=builder))
     log.info(
         "computed %d feature row(s) from %d event(s) (%s..%s)",
         len(rows),
@@ -107,6 +113,9 @@ def materialise(
     # replace_all, because this IS the full rebuild. Anything not derivable from the
     # landing zone has no business being in the store.
     store.write(rows, replace_all=True)
+
+    stamp = stamp_for([r.event_id for r in rows], str(events[-1][0]))
+    write_state(builder, stamp, store.base / STATE_FILE)
     return rows
 
 

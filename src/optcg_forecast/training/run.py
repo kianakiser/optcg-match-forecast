@@ -30,6 +30,7 @@ from typing import Any
 import numpy as np
 from sklearn.ensemble import HistGradientBoostingClassifier
 
+from optcg_forecast.features.serving_state import STATE_FILE, read_state, stamp_for
 from optcg_forecast.features.store import FEATURE_SET_VERSION, FeatureStore
 from optcg_forecast.training.evaluate import (
     COIN_BRIER,
@@ -456,10 +457,49 @@ def run(
         return 0
 
     registry.register(final_model, card)
+    _copy_serving_state(store, registry, version, rows)
     if promote:
         registry.set_alias(CHAMPION, version)
         log.info("promoted %s to %s", version, CHAMPION)
     return 0
+
+
+def _copy_serving_state(
+    store: FeatureStore, registry: ModelRegistry, version: str, rows: Sequence[dict[str, Any]]
+) -> None:
+    """Version the serving records with the model, after checking they describe the same corpus.
+
+    The check is the point. A model served against records built from a different corpus is
+    training-serving skew in its most literal form - the same handle carrying a different win
+    rate in training than in production - and it would surface as a quiet accuracy loss rather
+    than an error anyone could see.
+    """
+    source = store.base / STATE_FILE
+    if not source.is_file():
+        log.warning(
+            "no serving state at %s, so %s cannot answer a query that names players. "
+            "Run the feature pipeline to produce it.",
+            source,
+            version,
+        )
+        return
+
+    _, stamp = read_state(source)
+    expected = stamp_for(
+        [str(r["event_id"]) for r in rows], str(max(str(r["event_date"]) for r in rows))
+    )
+    if not stamp.matches(expected):
+        raise ValueError(
+            f"the serving state describes a different corpus from the one this model trained "
+            f"on, so serving it would skew every player feature.\n"
+            f"  state: {stamp.describe()}\n"
+            f"  model: {expected.describe()}\n"
+            f"Rebuild with: uv run python -m optcg_forecast.features.materialise"
+        )
+
+    target = registry.root / "versions" / version / STATE_FILE
+    target.write_bytes(source.read_bytes())
+    log.info("versioned serving state with %s: %s", version, stamp.describe())
 
 
 def main(argv: Iterable[str] | None = None) -> int:

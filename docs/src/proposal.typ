@@ -43,9 +43,14 @@ strictly earlier events. For competitive players and deck-builders.
 
 *Horizon.* One match, priced at pairing time and resolved within the hour it is played. The model is given only what is known before the first card is played — the
 two registered 50-card lists and both pilots' results at strictly earlier events — and predicts
-that match's outcome. It is served on demand through a web UI (a player picks two decks and gets a
-probability), and the same model is scored nightly against every match that resolved since the
-previous run. The provider lists a tournament only once it has finished, so there is no in-progress
+that match's outcome. It is served on demand through a web UI where a player
+enters two decks *and both players' Limitless handles*, and the same model is scored nightly
+against every match that resolved since the previous run. The handles are not optional garnish:
+pooled over six held-out windows the player-history terms are the signal (Brier 0.2314 with them,
+0.2441 without), and a deck-only model scores 0.2441 against 0.2452 for a plain matchup lookup —
+a difference our own promotion criterion would reject. Over the last six months 72.8% of pairings
+have prior history for both handles and 4.2% for neither; an unknown handle still gets an answer,
+flagged by `coverage`. The provider lists a tournament only once it has finished, so there is no in-progress
 feed to predict against in real time; the honest framing is on-demand serving plus nightly scoring,
 not live in-tournament inference. The reported winner is the label and is not computable from any
 feature.
@@ -103,6 +108,12 @@ Swiss matches* over 252 events and 25,206 entrants, *23,733 of them (94.2%) with
 list*, growing ≈ 588 matches and 3.8 events weekly over the last twelve weeks. The source is live,
 not an archive: in-scope events existed in the index but not in the corpus when this was written,
 the newest a day old.
+
+*Serving state.* The leader, player and matchup records that the features are computed from are
+written beside the feature store and copied into a model version when one is registered, stamped
+with a digest of the corpus that produced them. Registration refuses a mismatch: a model served
+against another corpus's records would give the same handle a different win rate in production
+than in training, and that skew would show up as lost accuracy rather than as an error.
 
 *Label.* `pairings[].winner`, the username the platform records from the reported result; no
 decklist rule yields it. The first-listed player wins 50.19% on that same corpus, so no rare

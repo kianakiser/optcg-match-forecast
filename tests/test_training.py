@@ -7,6 +7,7 @@ plausible numbers while quietly leaking the future is the failure mode worth spe
 
 from __future__ import annotations
 
+import json
 import math
 from datetime import date, timedelta
 
@@ -29,6 +30,7 @@ from optcg_forecast.training.run import (
     MIN_CALIBRATION_BUCKETS,
     SWAP,
     Evaluation,
+    _copy_serving_state,
     baseline_cell_rate,
     evaluate_block,
     evaluate_rolling,
@@ -439,3 +441,66 @@ def test_the_unsymmetrised_model_really_is_asymmetric():
     raw = model.predict_proba(x)[:, 1]
     raw_swapped = model.predict_proba(swap_sides(x))[:, 1]
     assert max(abs(a + b - 1.0) for a, b in zip(raw, raw_swapped, strict=True)) > 1e-6
+
+
+# ------------------------------------------------- serving state is versioned
+
+
+def _state_fixture(tmp_path, event_ids, through):
+    """Write a serving-state file stamped with a given corpus."""
+    from optcg_forecast.features.compute import FeatureBuilder
+    from optcg_forecast.features.serving_state import STATE_FILE, stamp_for, write_state
+
+    builder = FeatureBuilder()
+    builder.players["someone"].games = 10
+    builder.players["someone"].wins = 6
+    return write_state(builder, stamp_for(event_ids, through), tmp_path / STATE_FILE)
+
+
+class _Store:
+    def __init__(self, base):
+        self.base = base
+
+
+def test_serving_state_is_copied_into_the_model_version(tmp_path):
+    from optcg_forecast.features.serving_state import STATE_FILE
+
+    rows = [
+        {"event_id": "e1", "event_date": "2026-01-01"},
+        {"event_id": "e2", "event_date": "2026-01-08"},
+    ]
+    _state_fixture(tmp_path, ["e1", "e2"], "2026-01-08")
+
+    reg = ModelRegistry(root=tmp_path / "models")
+    reg.register({"m": 1}, _card("v1"))
+    _copy_serving_state(_Store(tmp_path), reg, "v1", rows)
+
+    copied = tmp_path / "models" / "versions" / "v1" / STATE_FILE
+    assert copied.is_file(), "rolling the champion back must roll its records back too"
+    assert json.loads(copied.read_text())["players"]["someone"] == [10, 6]
+
+
+def test_registering_refuses_state_from_a_different_corpus(tmp_path):
+    """A model served against another corpus's records is training-serving skew, silently.
+
+    The same handle would carry a different win rate in production than it did in training, and
+    nothing would raise — accuracy would just be quietly worse than the card claims.
+    """
+    rows = [{"event_id": "e1", "event_date": "2026-01-01"}]
+    _state_fixture(tmp_path, ["a-completely-different-event"], "2020-01-01")
+
+    reg = ModelRegistry(root=tmp_path / "models")
+    reg.register({"m": 1}, _card("v1"))
+    with pytest.raises(ValueError, match="different corpus"):
+        _copy_serving_state(_Store(tmp_path), reg, "v1", rows)
+
+
+def test_missing_serving_state_warns_rather_than_crashing(tmp_path, caplog):
+    """No state is a degraded model, not a broken pipeline — say so and carry on."""
+    reg = ModelRegistry(root=tmp_path / "models")
+    reg.register({"m": 1}, _card("v1"))
+    with caplog.at_level("WARNING"):
+        _copy_serving_state(
+            _Store(tmp_path), reg, "v1", [{"event_id": "e1", "event_date": "2026-01-01"}]
+        )
+    assert "no serving state" in caplog.text
