@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>One Piece TCG — match forecast</title>
+<style>
+  :root {
+    --bg: #faf8f5; --fg: #1b1a18; --muted: #6b6560; --line: #e2dcd4;
+    --card: #fff; --accent: #b23a48; --ok: #2f6f4f; --warn: #9a6a1f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16151a; --fg:#ece9e4; --muted:#9a938c; --line:#2e2c33;
+            --card:#1e1d23; --accent:#e0707c; --ok:#6fbf95; --warn:#d6a34a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 0 0 28px; font-size: .95rem; }
+  .card { background: var(--card); border:1px solid var(--line); border-radius: 12px; padding: 20px; }
+  .row { display:grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 560px) { .row { grid-template-columns: 1fr; } }
+  label { display:block; font-size:.82rem; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin-bottom:6px; }
+  select, input { width:100%; padding:10px 12px; border:1px solid var(--line); border-radius:8px;
+                  background:var(--bg); color:var(--fg); font-size:.95rem; }
+  .opt { margin-top:18px; padding-top:18px; border-top:1px dashed var(--line); }
+  .opt p { margin:0 0 14px; font-size:.87rem; color:var(--muted); }
+  button { margin-top:20px; width:100%; padding:12px; border:0; border-radius:8px; cursor:pointer;
+           background:var(--accent); color:#fff; font-size:1rem; font-weight:600; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  #out { margin-top:24px; display:none; }
+  .headline { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }
+  .pct { font-size:2.6rem; font-weight:700; letter-spacing:-0.02em; }
+  .who { color:var(--muted); font-size:.95rem; }
+  .bar { height:10px; border-radius:6px; background:var(--line); overflow:hidden; margin:14px 0 6px; }
+  .bar > span { display:block; height:100%; background:var(--accent); }
+  .second { margin-top:20px; padding-top:16px; border-top:1px solid var(--line); font-size:.95rem; }
+  .second .pct { font-size:1.6rem; }
+  .flag { display:inline-block; padding:2px 8px; border-radius:999px; font-size:.75rem;
+          text-transform:uppercase; letter-spacing:.05em; border:1px solid var(--line); }
+  .solid{color:var(--ok)} .prior_only{color:var(--warn)} .thin{color:var(--warn)} .cold{color:var(--accent)}
+  table { width:100%; border-collapse:collapse; margin-top:16px; font-size:.86rem; color:var(--muted); }
+  td { padding:4px 0; } td:last-child { text-align:right; color:var(--fg); font-variant-numeric:tabular-nums; }
+  footer { margin-top:28px; font-size:.8rem; color:var(--muted); }
+  footer code { font-size:.95em; }
+  .err { color:var(--accent); margin-top:16px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>One Piece TCG — match forecast</h1>
+  <p class="sub">Probability that the first deck wins a swiss round, from tournament results up to the model's training date.</p>
+
+  <div class="card">
+    <div class="row">
+      <div><label for="a">Leader A</label><select id="a"></select></div>
+      <div><label for="b">Leader B</label><select id="b"></select></div>
+    </div>
+
+    <div class="opt">
+      <p><strong>Optional.</strong> Add both players' Limitless handles to also get a forecast for those
+      two specific people. Leave blank for the deck matchup between evenly matched pilots.</p>
+      <div class="row">
+        <div><label for="ha">Handle A</label><input id="ha" placeholder="optional" autocomplete="off"></div>
+        <div><label for="hb">Handle B</label><input id="hb" placeholder="optional" autocomplete="off"></div>
+      </div>
+    </div>
+
+    <button id="go" disabled>Loading leaders…</button>
+    <div id="err" class="err"></div>
+  </div>
+
+  <div id="out" class="card">
+    <div class="headline">
+      <span class="pct" id="deckPct">—</span>
+      <span class="who" id="deckWho"></span>
+    </div>
+    <div class="bar"><span id="deckBar" style="width:50%"></span></div>
+    <div class="who">Deck matchup, between evenly matched pilots. <span class="flag" id="cov"></span></div>
+
+    <div class="second" id="matchBox" style="display:none">
+      <div class="headline"><span class="pct" id="matchPct">—</span><span class="who" id="matchWho"></span></div>
+      <div class="bar"><span id="matchBar" style="width:50%"></span></div>
+      <div class="who">With these two players' form. The difference from above is the pilots, not the cards.</div>
+    </div>
+
+    <table id="ev"></table>
+  </div>
+
+  <footer id="foot"></footer>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let leaders = [];
+
+const pct = (p) => (p * 100).toFixed(1) + "%";
+const nameOf = (id) => (leaders.find((l) => l.id === id) || {}).name || id;
+
+async function boot() {
+  try {
+    const r = await fetch("/leaders");
+    if (!r.ok) throw new Error("the service has no champion loaded yet");
+    leaders = (await r.json()).leaders;
+    for (const sel of [$("a"), $("b")]) {
+      sel.innerHTML = leaders
+        .map((l) => `<option value="${l.id}">${l.name} — ${l.id} (${l.games.toLocaleString()} games)</option>`)
+        .join("");
+    }
+    if (leaders.length > 1) $("b").selectedIndex = 1;
+    $("go").disabled = false;
+    $("go").textContent = "Forecast";
+
+    const v = await (await fetch("/version")).json();
+    $("foot").innerHTML =
+      `Model <code>${v.version}</code> · feature set <code>${v.feature_set_version}</code> · ` +
+      `trained through ${v.trained_through} on ${v.training_rows.toLocaleString()} matches ` +
+      `from ${v.training_events} events · commit <code>${v.git_sha}</code>`;
+  } catch (e) {
+    $("err").textContent = e.message;
+    $("go").textContent = "Unavailable";
+  }
+}
+
+$("go").onclick = async () => {
+  $("err").textContent = "";
+  $("go").disabled = true;
+  try {
+    const body = {
+      leader_a: $("a").value, leader_b: $("b").value,
+      handle_a: $("ha").value.trim() || null, handle_b: $("hb").value.trim() || null,
+    };
+    const r = await fetch("/predict", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || "the request was refused");
+
+    const A = nameOf(body.leader_a), B = nameOf(body.leader_b);
+    $("deckPct").textContent = pct(d.deck_probability);
+    $("deckWho").textContent = `${A} over ${B}`;
+    $("deckBar").style.width = (d.deck_probability * 100) + "%";
+    $("cov").textContent = d.coverage;
+    $("cov").className = "flag " + d.coverage;
+
+    if (d.match_probability !== null) {
+      $("matchBox").style.display = "block";
+      $("matchPct").textContent = pct(d.match_probability);
+      $("matchWho").textContent = `${body.handle_a} over ${body.handle_b}`;
+      $("matchBar").style.width = (d.match_probability * 100) + "%";
+    } else {
+      $("matchBox").style.display = "none";
+    }
+
+    const e = d.evidence;
+    const rows = [
+      [`${A} matches on record`, e.leader_a_games.toLocaleString()],
+      [`${B} matches on record`, e.leader_b_games.toLocaleString()],
+      ["This exact pairing", e.pairing_games.toLocaleString()],
+    ];
+    if (d.used_handles) {
+      rows.push([`${body.handle_a} matches on record`, e.player_a_games.toLocaleString()]);
+      rows.push([`${body.handle_b} matches on record`, e.player_b_games.toLocaleString()]);
+    }
+    $("ev").innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+    $("out").style.display = "block";
+  } catch (e) {
+    $("err").textContent = e.message;
+  } finally {
+    $("go").disabled = false;
+  }
+};
+boot();
+</script>
+</body>
+</html>

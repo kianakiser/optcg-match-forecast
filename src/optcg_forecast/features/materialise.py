@@ -154,7 +154,12 @@ def materialise(
     store.write(rows, replace_all=True)
 
     stamp = stamp_for([r.event_id for r in rows], str(events[-1][0]))
-    write_state(builder, stamp, store.base / STATE_FILE)
+    write_state(
+        builder,
+        stamp,
+        store.base / STATE_FILE,
+        leader_names={cid: c.name for cid, c in cat.items() if c.is_leader},
+    )
     return rows
 
 

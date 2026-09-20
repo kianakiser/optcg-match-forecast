@@ -38,6 +38,7 @@ class Card:
     """One printed card, reduced to the fields the features actually use."""
 
     id: str
+    name: str  # not a feature — the UI needs something a human recognises
     category: str  # Leader | Character | Event | Stage
     cost: int | None  # DON!! cost; None for "Cost —" events
     power: int | None  # None for cards with no power box
@@ -62,6 +63,7 @@ def _parse(raw: dict[str, Any]) -> Card | None:
     life = cost if category == "Leader" else None
     return Card(
         id=str(card_id),
+        name=str(raw.get("name") or card_id),
         category=category,
         cost=None if category == "Leader" else (int(cost) if cost is not None else None),
         power=int(raw["power"]) if raw.get("power") is not None else None,

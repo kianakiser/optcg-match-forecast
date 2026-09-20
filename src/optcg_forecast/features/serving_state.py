@@ -31,7 +31,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,15 @@ log = logging.getLogger(__name__)
 
 STATE_FILE = "serving_state.json"
 CELL_SEPARATOR = "|"
+
+
+@dataclass
+class ServingState:
+    """Everything a prediction needs, and nothing it does not."""
+
+    builder: FeatureBuilder
+    stamp: Stamp
+    leader_names: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -94,8 +103,20 @@ def _records_from_json(raw: dict[str, list[int]], key: Any = str) -> dict[Any, _
     return {key(k): _Record(games=int(v[0]), wins=int(v[1])) for k, v in raw.items()}
 
 
-def write_state(builder: FeatureBuilder, stamp: Stamp, target: Path) -> Path:
-    """Write the accumulated records, stamped with the corpus that produced them."""
+def write_state(
+    builder: FeatureBuilder,
+    stamp: Stamp,
+    target: Path,
+    leader_names: dict[str, str] | None = None,
+) -> Path:
+    """Write the accumulated records, stamped with the corpus that produced them.
+
+    `leader_names` travels with the records for a practical reason: the serving container has no
+    card catalogue. It ships the model and this file and nothing else, and the catalogue is
+    fetched over the network and cached under data/, which is not in the image. Without the
+    names baked in here, a deployed UI offers a dropdown of "OP07-079" instead of "Rob Lucci" -
+    a failure that never appears locally, because locally the cache exists.
+    """
     target.parent.mkdir(parents=True, exist_ok=True)
     leaders = _records_to_json(builder.leaders)
     players = _records_to_json(builder.players)
@@ -110,6 +131,7 @@ def write_state(builder: FeatureBuilder, stamp: Stamp, target: Path) -> Path:
         "leaders": leaders,
         "players": players,
         "cells": cells,
+        "leader_names": {k: v for k, v in (leader_names or {}).items() if k in leaders},
     }
     target.write_text(json.dumps(payload, separators=(",", ":")))
     log.info(
@@ -123,7 +145,7 @@ def write_state(builder: FeatureBuilder, stamp: Stamp, target: Path) -> Path:
     return target
 
 
-def read_state(source: Path) -> tuple[FeatureBuilder, Stamp]:
+def read_state(source: Path) -> ServingState:
     """Load records back into a builder that can emit features for a query."""
     payload = json.loads(source.read_text())
     raw = payload["stamp"]
@@ -146,4 +168,6 @@ def read_state(source: Path) -> tuple[FeatureBuilder, Stamp]:
     # The walk is finished; refuse to let anything append to loaded state, because a builder
     # resumed from disk has no idea which date it stopped at and could silently go backwards.
     builder._last_date = None
-    return builder, stamp
+    return ServingState(
+        builder=builder, stamp=stamp, leader_names=dict(payload.get("leader_names") or {})
+    )

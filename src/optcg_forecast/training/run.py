@@ -603,7 +603,7 @@ def _copy_serving_state(
         )
         return
 
-    _, stamp = read_state(source)
+    stamp = read_state(source).stamp
     expected = stamp_for(
         [str(r["event_id"]) for r in rows], str(max(str(r["event_date"]) for r in rows))
     )

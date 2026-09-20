@@ -70,7 +70,8 @@ def test_state_round_trips(tmp_path):
     stamp = stamp_for([f"e{i}" for i in range(8)], "2026-02-19")
 
     target = write_state(builder, stamp, tmp_path / "serving_state.json")
-    loaded, loaded_stamp = read_state(target)
+    st = read_state(target)
+    loaded, loaded_stamp = st.builder, st.stamp
 
     assert loaded_stamp == stamp
     assert {k: (v.games, v.wins) for k, v in loaded.leaders.items()} == {
@@ -88,9 +89,9 @@ def test_cell_keys_survive_being_stringified(tmp_path):
     """Cells are keyed by a tuple of leader ids; JSON has no tuple keys."""
     builder = FeatureBuilder()
     list(build(iter(corpus()), builder=builder))
-    loaded, _ = read_state(
+    loaded = read_state(
         write_state(builder, stamp_for(["e0"], "2026-01-01"), tmp_path / "s.json")
-    )
+    ).builder
     assert loaded.cells, "there must be cells to check"
     for key in loaded.cells:
         assert isinstance(key, tuple) and len(key) == 2
@@ -122,7 +123,7 @@ def test_serving_reproduces_training_features(tmp_path):
     saved = write_state(
         trainer, stamp_for([f"e{i}" for i in range(7)], str(last_date)), tmp_path / "s.json"
     )
-    served, _ = read_state(saved)
+    served = read_state(saved).builder
     actual = [
         served.features_for(m, leader_of[m.player1], leader_of[m.player2]) for m in last_matches
     ]
@@ -144,9 +145,9 @@ def test_an_unknown_handle_is_cold_not_average(tmp_path):
     """A player nobody has seen must read as no evidence, not as a middling one."""
     builder = FeatureBuilder()
     list(build(iter(corpus()), builder=builder))
-    served, _ = read_state(
+    served = read_state(
         write_state(builder, stamp_for(["e0"], "2026-01-01"), tmp_path / "s.json")
-    )
+    ).builder
     row = served.features_for(
         mt("query", "p0", "someone-who-has-never-played", "p0", START), "L0", "L1"
     )
@@ -158,9 +159,9 @@ def test_loaded_state_will_not_silently_continue_the_walk(tmp_path):
     """Resumed state does not know which date it stopped at, so it must not accept more."""
     builder = FeatureBuilder()
     list(build(iter(corpus()), builder=builder))
-    served, _ = read_state(
+    served = read_state(
         write_state(builder, stamp_for(["e0"], "2026-01-01"), tmp_path / "s.json")
-    )
+    ).builder
     assert served._last_date is None
 
 
@@ -190,5 +191,29 @@ def test_state_file_is_json_a_human_can_open(tmp_path):
     list(build(iter(corpus()), builder=builder))
     target = write_state(builder, stamp_for(["e0"], "2026-01-01"), tmp_path / "serving_state.json")
     payload = json.loads(target.read_text())
-    assert set(payload) == {"stamp", "leaders", "players", "cells"}
+    assert set(payload) == {"stamp", "leaders", "players", "cells", "leader_names"}
     assert all(len(v) == 2 for v in payload["players"].values()), "[games, wins] per entry"
+
+
+def test_leader_names_travel_with_the_records(tmp_path):
+    """The serving container has no card catalogue; without these the UI offers card ids."""
+    builder = FeatureBuilder()
+    list(build(iter(corpus()), builder=builder))
+    target = write_state(
+        builder,
+        stamp_for(["e0"], "2026-01-01"),
+        tmp_path / "s.json",
+        leader_names={"L0": "Monkey.D.Luffy", "L1": "Rob Lucci", "L9": "not in the records"},
+    )
+    loaded = read_state(target)
+    assert loaded.leader_names["L0"] == "Monkey.D.Luffy"
+    assert "L9" not in loaded.leader_names, "names for leaders with no history are dead weight"
+
+
+def test_state_without_names_still_loads(tmp_path):
+    """An older state file must degrade to ids, not fail to load."""
+    builder = FeatureBuilder()
+    list(build(iter(corpus()), builder=builder))
+    loaded = read_state(write_state(builder, stamp_for(["e0"], "2026-01-01"), tmp_path / "s.json"))
+    assert loaded.leader_names == {}
+    assert loaded.builder.leaders

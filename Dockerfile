@@ -14,11 +14,11 @@ WORKDIR /app
 # Dependency layer first, so it caches independently of source edits.
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-install-project --no-dev
+    uv sync --locked --no-install-project --no-dev --extra serve
 
 COPY src/ ./src/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-dev
+    uv sync --locked --no-dev --extra serve
 
 
 FROM python:3.12-slim-bookworm AS runtime
@@ -31,6 +31,11 @@ WORKDIR /app
 
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
 COPY --from=builder --chown=app:app /app/src /app/src
+
+# The registry is not baked in: the image is the same for every model, and the champion it
+# serves is whatever is mounted or fetched at deploy time. Baking a model into an image makes
+# "which version is live" a question about image tags instead of about the registry.
+ENV MODEL_ROOT=/app/data/models
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \

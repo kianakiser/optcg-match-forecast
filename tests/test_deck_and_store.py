@@ -16,6 +16,7 @@ from optcg_forecast.features.store import FeatureStore
 def card(cid, category="Character", cost=3, power=5000, counter=1000, trigger=False):
     return Card(
         id=cid,
+        name=f"Card {cid}",
         category=category,
         cost=cost,
         power=power,
