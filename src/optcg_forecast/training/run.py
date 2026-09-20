@@ -459,33 +459,44 @@ def run(
         feature_names=FEATURES,
         hyperparameters=best_params,
         metrics={
-            # The promotion decision was made on these.
-            "brier": gate.model_scores.brier,
-            "log_loss": gate.model_scores.log_loss,
-            "accuracy": gate.model_scores.accuracy,
-            "brier_skill": gate.model_scores.brier_skill,
-            "skill_ci_low": gate.skill_ci[0],
-            "skill_ci_high": gate.skill_ci[1],
-            "matchup_only_brier": gate.cell_scores.brier,
-            # The deck question, answered by the same model with both pilots set to average.
-            "deck_only_brier": gate.deck_scores.brier,
-            "deck_only_accuracy": gate.deck_scores.accuracy,
-            "contract_deck_only_brier": best.deck_scores.brier,
-            "calibration_ece": gate.calibration.ece,
-            "calibration_worst_gap": gate.calibration.worst_gap,
+            # Every key says WHICH SAMPLE it came from, because the two disagree and the
+            # disagreement is not a mistake. `gate_` is the 2,454-match block held back before
+            # any model was fitted; `pooled_` is the six rolling windows, 12,574 matches, which
+            # is the object the written contract is defined over.
+            #
+            # Concretely: gate_deck_brier is WORSE than gate_matchup_brier while
+            # pooled_deck_brier is BETTER than pooled_matchup_brier. The deck edge is 0.0008 and
+            # 2,454 rows cannot resolve it; 12,574 can. Naming these both "deck_only_brier"
+            # invited exactly the wrong reading.
+            #
+            # The promotion decision used the gate_ figures for the relative checks and the
+            # pooled_ figures for the absolute ones.
+            "gate_brier": gate.model_scores.brier,
+            "gate_accuracy": gate.model_scores.accuracy,
+            "gate_log_loss": gate.model_scores.log_loss,
+            "gate_brier_skill": gate.model_scores.brier_skill,
+            "gate_skill_ci_low": gate.skill_ci[0],
+            "gate_skill_ci_high": gate.skill_ci[1],
+            "gate_matchup_brier": gate.cell_scores.brier,
+            "gate_deck_brier": gate.deck_scores.brier,
+            "gate_deck_accuracy": gate.deck_scores.accuracy,
+            "gate_calibration_ece": gate.calibration.ece,
+            "gate_rows": float(gate.model_scores.n),
+            "pooled_brier": best.model_scores.brier,
+            "pooled_accuracy": best.model_scores.accuracy,
+            "pooled_matchup_brier": best.cell_scores.brier,
+            "pooled_deck_brier": best.deck_scores.brier,
+            "pooled_calibration_ece": best.calibration.ece,
+            "pooled_calibration_worst_gap": best.calibration.worst_gap,
+            "pooled_calibration_worst_z": best.calibration.worst_z,
+            "pooled_calibration_buckets": float(best.calibration.buckets),
+            "pooled_rows": float(best.model_scores.n),
+            "pooled_windows": float(best.windows),
+            # The gap between gate_brier and pooled_brier is the cost of picking a winner from
+            # five candidates. Both are kept so it stays visible; a gap that grows means the
+            # sweep has started overfitting and should be cut down rather than widened.
+            "selection_optimism": best.model_scores.brier - gate.model_scores.brier,
             "coin_brier": COIN_BRIER,
-            # The contract is judged on the pooled windows, so record what it saw.
-            "contract_calibration_ece": best.calibration.ece,
-            "contract_calibration_worst_gap": best.calibration.worst_gap,
-            "contract_calibration_worst_z": best.calibration.worst_z,
-            "contract_calibration_buckets": float(best.calibration.buckets),
-            "contract_eval_rows": float(best.model_scores.n),
-            "contract_windows": float(best.windows),
-            # The selection windows, kept because a large gap between the two is the signal
-            # that the sweep overfitted, and it is only visible if both are recorded.
-            "selection_brier": best.model_scores.brier,
-            "selection_accuracy": best.model_scores.accuracy,
-            "selection_matchup_only_brier": best.cell_scores.brier,
         },
         training_rows=len(rows),
         training_events=len({r["event_id"] for r in rows}),
