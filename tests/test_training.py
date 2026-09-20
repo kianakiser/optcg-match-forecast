@@ -10,18 +10,24 @@ from __future__ import annotations
 import math
 from datetime import date, timedelta
 
+import numpy as np
 import pytest
 
 from optcg_forecast.training.evaluate import (
     COIN_BRIER,
+    Calibration,
+    assess_calibration,
     calibration,
     event_cluster_bootstrap,
     score,
-    worst_calibration_gap,
 )
 from optcg_forecast.training.registry import CHAMPION, ModelRegistry, build_card
 from optcg_forecast.training.run import (
     FEATURES,
+    MAX_CALIBRATION_Z,
+    MAX_ECE,
+    MIN_CALIBRATION_BUCKETS,
+    SWAP,
     Evaluation,
     baseline_cell_rate,
     evaluate_block,
@@ -29,6 +35,7 @@ from optcg_forecast.training.run import (
     fit,
     predict,
     run,
+    swap_sides,
     to_matrix,
 )
 from optcg_forecast.training.split import (
@@ -107,7 +114,49 @@ def test_calibration_gap_ignores_thin_buckets():
     """A bucket with three rows says nothing; it must not drive the reported gap."""
     probs = [0.95, 0.95, 0.95] + [0.5] * 400
     labels = [0, 0, 0] + [1, 0] * 200
-    assert worst_calibration_gap(probs, labels, min_n=250) < 0.05
+    c = assess_calibration(probs, labels, min_n=250)
+    assert c.worst_gap < 0.05
+    assert c.buckets == 1, "only the fat bucket may count"
+
+
+def test_calibration_reports_no_evidence_rather_than_perfection():
+    """It used to return 0.0 when nothing qualified, which reads as flawless calibration.
+
+    A safety check that fails open is worse than no check, because it is trusted.
+    """
+    c = assess_calibration([0.9] * 10 + [0.1] * 10, [1] * 10 + [0] * 10, min_n=250)
+    assert c.buckets == 0, "no bucket is big enough to say anything"
+    assert c.ece == 0.0
+    # and the contract must treat too few buckets as a failure, not a pass
+    assert MIN_CALIBRATION_BUCKETS > 0
+
+
+def test_ece_does_not_grow_with_bucket_count_but_the_max_does():
+    """Why the contract gates on ECE: the max statistic measures how many buckets you have.
+
+    Both halves here are perfectly calibrated by construction. Splitting the same predictions
+    across more buckets leaves ECE alone and inflates the worst gap.
+    """
+    import random
+
+    rng = random.Random(7)
+    few = [0.4] * 3000 + [0.6] * 3000
+    many = [0.30 + 0.05 * (i % 9) for i in range(6000)]
+    c_few = assess_calibration(few, [1 if rng.random() < p else 0 for p in few])
+    c_many = assess_calibration(many, [1 if rng.random() < p else 0 for p in many])
+
+    assert c_many.buckets > c_few.buckets
+    assert c_many.worst_gap > c_few.worst_gap, "the max grows with bucket count"
+    assert abs(c_many.ece - c_few.ece) < 0.02, "ECE does not"
+
+
+def test_a_genuinely_miscalibrated_model_is_caught():
+    """The check still has to bite, or replacing the criterion would be goalpost-moving."""
+    probs = [0.8] * 2000  # claims 80%...
+    labels = [1] * 1000 + [0] * 1000  # ...delivers 50%
+    c = assess_calibration(probs, labels)
+    assert c.ece > MAX_ECE
+    assert c.worst_z > MAX_CALIBRATION_Z
 
 
 def test_calibration_buckets_cover_every_prediction():
@@ -206,7 +255,7 @@ def test_evaluation_reports_a_loss_against_the_baseline_honestly():
         model_scores=score([0.5] * 10, [1, 0] * 5),
         cell_scores=score([0.6, 0.4] * 5, [1, 0] * 5),  # the simple baseline does better
         skill_ci=(-0.01, 0.02),
-        calibration_gap=0.03,
+        calibration=Calibration(ece=0.02, worst_gap=0.03, worst_z=1.1, buckets=4),
         windows=3,
     )
     assert not ev.beats_coin
@@ -340,3 +389,53 @@ def test_a_model_with_no_signal_is_refused(tmp_path, monkeypatch, caplog):
         )
     assert "REJECTED" in caplog.text
     assert not (tmp_path / "models" / "versions").exists()
+
+
+# ------------------------------------------------------- orientation invariance
+
+
+def test_every_feature_has_a_swap_rule():
+    """A feature added without one would silently break the symmetry guarantee."""
+    assert set(SWAP) == set(FEATURES)
+
+
+def test_swapping_twice_is_the_identity():
+    """The clearest evidence the transform is right: it is its own inverse."""
+    rows = make_rows(n_events=3, per_event=20)
+    x, _, _ = to_matrix(rows)
+    assert np.allclose(swap_sides(swap_sides(x)), x)
+
+
+def test_prediction_does_not_depend_on_who_is_listed_first():
+    """The provider's first slot is arbitrary — it is not the player who goes first.
+
+    Without symmetrisation a tree has no idea that exchanging the players should turn p into
+    1 - p, and measurably does not.
+    """
+    rows = make_rows()
+    train, held = final_holdout(rows)
+    model = fit(train, {"max_depth": 3, "learning_rate": 0.1, "max_iter": 50})
+
+    x, _, _ = to_matrix(held)
+    mirrored = [dict(r) for r in held]
+    swapped = swap_sides(x)
+    for i, r in enumerate(mirrored):
+        for j, f in enumerate(FEATURES):
+            r[f] = swapped[i][j]
+
+    forward = predict(model, held)
+    backward = predict(model, mirrored)
+    worst = max(abs(a + b - 1.0) for a, b in zip(forward, backward, strict=True))
+    assert worst < 1e-9, f"p(A beats B) + p(B beats A) must be 1, worst violation {worst}"
+
+
+def test_the_unsymmetrised_model_really_is_asymmetric():
+    """Guards the guard: if this ever passes trivially, the test above proves nothing."""
+    rows = make_rows()
+    train, held = final_holdout(rows)
+    model = fit(train, {"max_depth": 3, "learning_rate": 0.1, "max_iter": 50})
+
+    x, _, _ = to_matrix(held)
+    raw = model.predict_proba(x)[:, 1]
+    raw_swapped = model.predict_proba(swap_sides(x))[:, 1]
+    assert max(abs(a + b - 1.0) for a, b in zip(raw, raw_swapped, strict=True)) > 1e-6

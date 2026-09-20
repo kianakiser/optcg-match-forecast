@@ -35,8 +35,10 @@ question — and out of time the per-player strength term turns out to contribut
 lives in archetype-vs-archetype matchup cells.
 
 **The label is not derivable from the features.** It is the outcome of a game between two humans.
-Player 1 wins 50.19% of 68,322 decided swiss matches — a Wilson CI of [49.82%, 50.57%], so seat
-position is not distinguishable from a coin flip and carries no free signal.
+The API's first-listed player wins 50.2% of 68,320 decided swiss matches, a Wilson CI that spans
+50%, so which slot a player occupies in the payload is not distinguishable from a coin flip and
+carries no free signal. (That slot is *not* the player who goes first: turn order is decided at
+the table and the API does not record it.)
 
 **Success criterion.** Pooled **Brier ≤ 0.2490** against the coin-flip 0.2500, over ≥ 6 held-out
 28-day windows (≥ 8,000 matches), with the 95% event-cluster bootstrap CI on the skill excluding
@@ -61,7 +63,7 @@ because the 0.0053 gap between them is the cost of selection and is only visible
 |---|---|
 | Source | Limitless TCG tournament API (`play.limitlesstcg.com/api`) — keyless, community-run |
 | Corpus (2024-09-07 to 2026-09-17) | 277 events · 25,206 entrants · **23,733 with full 50-card decklists** (94.2%) |
-| Usable matches | **68,322** decided swiss matches from 254 events; 11,685 of them round 1 |
+| Usable matches | **68,320** decided swiss matches from 252 events |
 | Concentration | largest organiser is 34.0% of matches (61.4% of events) — down from 80.2% before the two-year backfill |
 | Leaders seen | 133 distinct |
 | Update | event-driven; new events are immutable once finished, so re-fetch by id is safe |
@@ -108,8 +110,8 @@ Three decoupled pipelines — they never call each other, only the feature store
 
 | | Pipeline | Trigger | Reads | Writes |
 |---|---|---|---|---|
-| 1 | **Feature** | GitHub Actions, daily + on-demand backfill | Limitless API | Hopsworks |
-| 2 | **Training** | scheduled / manual | Hopsworks feature view | Hopsworks model registry |
+| 1 | **Feature** | GitHub Actions, daily + on-demand backfill | Limitless API | landing zone, then the feature store |
+| 2 | **Training** | GitHub Actions, weekly | feature store | model registry (on promotion only) |
 | 3 | **Inference** | on demand (UI) + nightly scoring | registry + feature store | predictions / UI |
 
 Regenerate the diagram after any stack change:
@@ -122,15 +124,20 @@ Regenerate the diagram after any stack change:
 
 | Concern | Choice | Why |
 |---|---|---|
-| Feature store | Hopsworks | point-in-time-correct joins — training and serving read one feature definition, so a player-history feature can never silently include the event being predicted |
-| Model registry | Hopsworks | the same hosted service as the feature store; promotion moves the `champion` alias rather than redeploying |
+| Feature store | versioned Parquet, partitioned by month | point-in-time correctness is enforced in the compute pass — rows are emitted from state as it stood before their *date*, and only then does the day's results fold in. Writes are idempotent at event level, and a rebuild replaces the store rather than merging into it |
+| Model registry | local, immutable versions + movable aliases | promotion moves the `champion` alias rather than redeploying, which makes rollback the same operation backwards. Hopsworks was the original plan; the discipline is what is graded and what must survive a migration, so it was built directly |
 | Experiment tracking | Weights & Biases | hosted run tracking, so there is no MLflow server to operate for a project this size |
 | Orchestration | GitHub Actions | scheduled pipelines live beside the code, and the runner stays the ingest edge rather than a cloud IP range |
 | Serving | Google Cloud Run | container deploy, scales to zero between events |
-| Storage | Google Cloud Storage | immutable partitioned landing zone for raw payloads, so features can always be rebuilt |
+| Storage | GitHub Actions cache today, Google Cloud Storage next | the landing zone is the one durable artefact — immutable event payloads, from which the feature store is always rebuilt. The cache is honestly interim; see `notes/gcp_setup.md` |
 
-**Stretch, explicitly optional:** drift monitoring on decklist composition, a second tournament
-feed to reduce organiser concentration, and calibration dashboards. Core FTI ships first.
+**Not built yet.** The inference pipeline is a design, not code: `src/optcg_forecast/inference/`
+is empty and the Dockerfile's entrypoint refers to a module that does not exist, so the image
+builds and will not start. It is listed in the table because the architecture is decided, not
+because it runs. See `notes/gcp_setup.md` for what it needs.
+
+**Stretch, explicitly optional:** drift monitoring on decklist composition and calibration
+dashboards. Core FTI ships first.
 
 ## Clone and run
 
@@ -141,10 +148,10 @@ cd optcg-match-forecast
 uv sync                      # exact versions from uv.lock
 cp .env.example .env         # then fill it in — see the table below
 
-uv run python -m optcg_forecast.features.run                       # ingest + write features
-uv run python -m optcg_forecast.features.backfill --start 2025-07-06 --end 2026-09-18
-uv run python -m optcg_forecast.training.run                       # train, evaluate, register
-uv run python -m optcg_forecast.inference.serve                    # serve predictions
+uv run python -m optcg_forecast.features.run                    # ingest, then rebuild features
+uv run python -m optcg_forecast.features.run --pages 5          # same path, walking back further
+uv run python -m optcg_forecast.features.materialise            # rebuild features, no API calls
+uv run python -m optcg_forecast.training.run                    # train, evaluate, maybe promote
 ```
 
 Backfill runs through the **same** feature pipeline as live ingest — one code path, so a repaired

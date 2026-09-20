@@ -56,7 +56,7 @@ jobs:
       # a GCS bucket once the cloud account exists, which is a change of root path and nothing
       # else.
       - name: Restore the landing zone
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6.1.0
         with:
           path: data/landing
           key: landing-${{ github.run_id }}
@@ -71,21 +71,60 @@ jobs:
       # the next run can. A first run with no cache simply has no champion to beat, which the
       # pipeline handles.
       - name: Restore the model registry
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6.1.0
         with:
           path: data/models
           key: models-${{ github.run_id }}
           restore-keys: models-
 
       - name: Train, evaluate and decide
+        env:
+          # A scheduled run has NO inputs context at all — the docs are explicit that its
+          # properties are "only available in a reusable workflow or in a workflow triggered by
+          # the workflow_dispatch event" — so `inputs.promote` is null on cron. And in Actions
+          # expressions `null == false` is TRUE, because loose equality coerces both sides to 0.
+          #
+          # The previous form here was `${{ inputs.promote == false && '--no-promote' || '' }}`,
+          # which therefore fired on EVERY weekly retrain: the job trained, evaluated, registered
+          # a version and then never moved the alias. Green every Monday, champion frozen for
+          # ever. Gate on the event name instead, so cron promotes and only a manual rehearsal
+          # opts out.
+          #
+          # Values are passed through env rather than interpolated into the shell directly.
+          # `${{ }}` substitutes before bash sees the line, so a free-text input becomes script.
+          PROMOTE: ${{ github.event_name != 'workflow_dispatch' || inputs.promote }}
+          MAX_WINDOWS: ${{ inputs.max_windows || 6 }}
         run: |
-          uv run python -m optcg_forecast.training.run \
-            --max-windows "${{ inputs.max_windows || 6 }}" \
-            ${{ inputs.promote == false && '--no-promote' || '' }}
+          args=(--max-windows "$MAX_WINDOWS")
+          [ "$PROMOTE" = "true" ] || args+=(--no-promote)
+          uv run python -m optcg_forecast.training.run "${args[@]}"
+
+      # The promotion decision was invisible, which is how the bug above could have run for
+      # months unnoticed: the job exits 0 whether it promoted, was rejected by the gate, or kept
+      # the incumbent. Say which, where a human will see it.
+      - name: Report the decision
+        if: always()
+        run: |
+          {
+            echo "### Training run"
+            uv run python -c "
+          from optcg_forecast.training.registry import CHAMPION, ModelRegistry
+          reg = ModelRegistry()
+          card = reg.card(CHAMPION)
+          print(f'| versions | {\", \".join(reg.versions()) or \"none\"} |')
+          print('|---|---|')
+          if card is None:
+              print('| champion | **none** — nothing has been promoted |')
+          else:
+              print(f'| champion | {card.version}, trained through {card.trained_through} |')
+              for k, v in sorted(card.metrics.items()):
+                  print(f'| {k} | {v:.4f} |')
+          " || echo "could not read the registry"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Save the model registry
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6.1.0
         with:
           path: data/models
           key: models-${{ github.run_id }}
@@ -94,7 +133,7 @@ jobs:
       # audited later: which model, on what metrics, against which incumbent.
       - name: Upload the model cards
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: model-registry-${{ github.run_id }}
           path: |

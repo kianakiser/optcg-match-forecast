@@ -33,10 +33,11 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from optcg_forecast.features.store import FEATURE_SET_VERSION, FeatureStore
 from optcg_forecast.training.evaluate import (
     COIN_BRIER,
+    Calibration,
     Scores,
+    assess_calibration,
     event_cluster_bootstrap,
     score,
-    worst_calibration_gap,
 )
 from optcg_forecast.training.registry import CHAMPION, ModelRegistry, build_card
 from optcg_forecast.training.split import (
@@ -47,7 +48,8 @@ from optcg_forecast.training.split import (
 
 log = logging.getLogger("optcg_forecast.training")
 
-# Everything the model sees. All differences, so seat order cannot be learned as a signal.
+# Everything the model sees. Nine of the thirteen are differences; the other four are
+# orientation-dependent levels, which is why SWAP below exists and why predict() symmetrises.
 FEATURES = [
     "leader_strength_diff",
     "player_strength_diff",
@@ -74,6 +76,29 @@ SWEEP: list[dict[str, Any]] = [
     {"max_depth": None, "learning_rate": 0.05, "max_iter": 250, "min_samples_leaf": 200},
 ]
 
+# How each feature transforms when the two players change places. The provider lists one of
+# them first and that slot is arbitrary - it is not the player who goes first, which is decided
+# at the table and never recorded - so nothing downstream may depend on it.
+#
+# "negate" for the nine differences, "complement" for cell_rate (a rate from the listed player's
+# side, so it becomes 1 - x rather than -x), "swap" for the pair of leader game counts, and
+# "same" for cell_games, which counts the pairing and does not care about order.
+SWAP: dict[str, str | tuple[str, str]] = {
+    "leader_strength_diff": "negate",
+    "player_strength_diff": "negate",
+    "cell_rate": "complement",
+    "experience_diff": "negate",
+    "counter_2k_diff": "negate",
+    "avg_cost_diff": "negate",
+    "high_curve_diff": "negate",
+    "big_body_diff": "negate",
+    "event_copies_diff": "negate",
+    "trigger_copies_diff": "negate",
+    "cell_games": "same",
+    "p1_leader_games": ("swap", "p2_leader_games"),
+    "p2_leader_games": ("swap", "p1_leader_games"),
+}
+
 SEED = 42
 
 
@@ -90,14 +115,69 @@ def baseline_cell_rate(rows: Sequence[dict[str, Any]]) -> list[float]:
 
 def fit(rows: Sequence[dict[str, Any]], params: dict[str, Any]) -> HistGradientBoostingClassifier:
     x, y, _ = to_matrix(rows)
-    model = HistGradientBoostingClassifier(random_state=SEED, **params)
+    # early_stopping="auto" switches on above 10,000 samples - which every training set here
+    # exceeds - and carves its validation slice out at random. A random slice of a time-ordered
+    # training set is the one thing this whole package argues against, and it also makes the fit
+    # depend on the seed in a way nothing records. Off, so the fit is determined by the data and
+    # max_iter alone.
+    model = HistGradientBoostingClassifier(random_state=SEED, early_stopping=False, **params)
     model.fit(x, y)
     return model
 
 
-def predict(model: HistGradientBoostingClassifier, rows: Sequence[dict[str, Any]]) -> list[float]:
+def swap_sides(x: np.ndarray) -> np.ndarray:
+    """Return the feature matrix as it would look with the two players exchanged."""
+    idx = {f: i for i, f in enumerate(FEATURES)}
+    out = x.copy()
+    for feature, rule in SWAP.items():
+        i = idx[feature]
+        if rule == "negate":
+            out[:, i] = -x[:, i]
+        elif rule == "complement":
+            out[:, i] = 1.0 - x[:, i]
+        elif isinstance(rule, tuple):
+            out[:, i] = x[:, idx[rule[1]]]
+        # "same" needs no work
+    return out
+
+
+def predict(
+    model: HistGradientBoostingClassifier,
+    rows: Sequence[dict[str, Any]],
+    *,
+    symmetrise: bool = True,
+) -> list[float]:
+    """P(the listed first player wins), independent of which player is listed first.
+
+    A gradient-boosted tree has no idea that exchanging the two players ought to turn p into
+    1 - p. Measured on the champion, it does not: the mean absolute violation is 0.032 and the
+    worst is 0.174, so the same pairing entered the other way round gets a different answer.
+
+    Almost all of the sign changes that causes sit where the model has no opinion anyway -
+    99.7% of them where the probability is already within a whisker of a coin flip - so this is
+    a determinacy problem rather than an accuracy one. It is still a real one: a service that
+    answers "58%" or "55%" for the same two decks depending on typing order is not one you can
+    defend, and the fix is exact rather than approximate.
+
+    Averaging the model with its own mirror image makes antisymmetry hold by construction, for
+    the price of one extra forward pass. Doing it here, in the one path both evaluation and
+    serving use, is what stops the two disagreeing later.
+    """
     x, _, _ = to_matrix(rows)
-    return [float(p) for p in model.predict_proba(x)[:, 1]]
+    p = model.predict_proba(x)[:, 1]
+    if symmetrise:
+        mirrored = model.predict_proba(swap_sides(x))[:, 1]
+        p = (p + (1.0 - mirrored)) / 2.0
+    return [float(v) for v in p]
+
+
+# The contract the proposal commits to, in one place, so the document and the code cannot drift.
+MAX_BRIER = 0.2490
+MIN_WINDOWS = 6
+MIN_EVAL_ROWS = 8_000
+MAX_ECE = 0.03
+MAX_CALIBRATION_Z = 3.0
+MIN_CALIBRATION_BUCKETS = 3
 
 
 @dataclass
@@ -107,7 +187,7 @@ class Evaluation:
     model_scores: Scores
     cell_scores: Scores
     skill_ci: tuple[float, float]
-    calibration_gap: float
+    calibration: Calibration
     windows: int
 
     @property
@@ -123,8 +203,84 @@ class Evaluation:
             f"model {self.model_scores.summary()} | "
             f"matchup-only brier={self.cell_scores.brier:.4f} | "
             f"skill CI [{self.skill_ci[0]:+.4f}, {self.skill_ci[1]:+.4f}] | "
-            f"worst calibration gap {self.calibration_gap:.1%} | {self.windows} windows"
+            f"{self.calibration.summary()} | {self.windows} windows"
         )
+
+
+@dataclass(frozen=True)
+class Check:
+    """One named promotion criterion and how it went."""
+
+    name: str
+    passed: bool
+    detail: str
+
+
+def contract(rolling: Evaluation, gate: Evaluation) -> list[Check]:
+    """The written success criterion, as code, applied to the sample it was written about.
+
+    The proposal commits to six things. They were prose and nothing enforced them, which is how
+    a model got promoted on a 3.1% calibration gap against a stated threshold of 3.0% without
+    anything noticing.
+
+    Which sample each check runs on matters as much as the threshold. The proposal defines the
+    contract over "≥ 6 held-out 28-day windows (≥ 8,000 matches)", so the absolute quality
+    checks belong on the POOLED WINDOWS, where there are 12,574 rows and calibration buckets of
+    roughly 1,200. Running them on the 2,454-row gate block instead was measuring a
+    max-over-buckets statistic at a noise floor of about 2.8 points against a 3.0 point
+    threshold - a coin toss dressed as a criterion.
+
+    The gate block keeps the job it is good at: confirming that a winner chosen on the windows
+    still beats the coin and the matchup baseline on data nothing was selected against.
+    """
+    low, _ = gate.skill_ci
+    return [
+        Check(
+            "windows",
+            rolling.windows >= MIN_WINDOWS,
+            f"{rolling.windows} evaluated, {MIN_WINDOWS} required",
+        ),
+        Check(
+            "evaluation rows",
+            rolling.model_scores.n >= MIN_EVAL_ROWS,
+            f"{rolling.model_scores.n:,} pooled, {MIN_EVAL_ROWS:,} required",
+        ),
+        Check(
+            "brier",
+            rolling.model_scores.brier <= MAX_BRIER,
+            f"{rolling.model_scores.brier:.4f} pooled, must be <= {MAX_BRIER}",
+        ),
+        Check(
+            "beats matchup baseline",
+            gate.beats_cell_baseline,
+            f"{gate.model_scores.brier:.4f} vs {gate.cell_scores.brier:.4f} on the held-out gate",
+        ),
+        Check(
+            "skill interval clear of zero",
+            low > 0,
+            f"gate CI [{low:+.4f}, {gate.skill_ci[1]:+.4f}]",
+        ),
+        # The proposal said "gaps <= 3 points in every bucket". Taken literally that is a
+        # maximum over buckets, and simulation on this project's own predictions shows a
+        # PERFECTLY calibrated model breaching it 74% of the time - so it measures bucket count,
+        # not calibration. Replaced by the two things it was reaching for: the standard expected
+        # calibration error carries the 3-point threshold, and no single bucket may be off by
+        # more than three of its own standard errors. A genuinely miscalibrated model fails
+        # both; noise fails neither.
+        Check(
+            "calibration (ECE)",
+            rolling.calibration.buckets >= MIN_CALIBRATION_BUCKETS
+            and rolling.calibration.ece <= MAX_ECE,
+            f"ECE {rolling.calibration.ece:.2%} over {rolling.calibration.buckets} pooled "
+            f"bucket(s), must be <= {MAX_ECE:.0%} over >= {MIN_CALIBRATION_BUCKETS}",
+        ),
+        Check(
+            "no bucket significantly off",
+            rolling.calibration.worst_z <= MAX_CALIBRATION_Z,
+            f"worst bucket is {rolling.calibration.worst_z:.1f} sigma from its predicted rate "
+            f"(gap {rolling.calibration.worst_gap:.2%}), must be <= {MAX_CALIBRATION_Z:.0f}",
+        ),
+    ]
 
 
 def evaluate_rolling(
@@ -155,7 +311,7 @@ def evaluate_rolling(
         model_scores=score(probs, labels),
         cell_scores=score(cells, labels),
         skill_ci=event_cluster_bootstrap(probs, labels, events, seed=SEED),
-        calibration_gap=worst_calibration_gap(probs, labels),
+        calibration=assess_calibration(probs, labels),
         windows=windows,
     )
 
@@ -175,7 +331,7 @@ def evaluate_block(
         model_scores=score(probs, labels),
         cell_scores=score(baseline_cell_rate(test), labels),
         skill_ci=event_cluster_bootstrap(probs, labels, events, seed=SEED),
-        calibration_gap=worst_calibration_gap(probs, labels),
+        calibration=assess_calibration(probs, labels),
         windows=1,
     )
 
@@ -224,21 +380,16 @@ def run(
     gate = evaluate_block(select_rows, holdout, best_params)
     log.info("gate:  %s", gate.summary())
 
-    # The honest checks, in order of how much they matter. All are applied to the gate rather
-    # than to the selection windows, because the selection windows helped choose the winner.
-    if not gate.beats_coin:
+    checks = contract(best, gate)
+    for check in checks:
+        log.info("  [%s] %-28s %s", "PASS" if check.passed else "FAIL", check.name, check.detail)
+    failed = [c for c in checks if not c.passed]
+    if failed:
         log.warning(
-            "REJECTED: held-out skill interval [%+.4f, %+.4f] includes zero — no evidence of "
-            "skill on data the sweep never saw",
-            *gate.skill_ci,
-        )
-        return 0
-    if not gate.beats_cell_baseline:
-        log.warning(
-            "REJECTED: the classifier (%.4f) does not beat the plain matchup rate (%.4f) on the "
-            "held-out block. Register the simpler thing and say so.",
-            gate.model_scores.brier,
-            gate.cell_scores.brier,
+            "REJECTED: %d of %d promotion criteria not met (%s). Nothing registered.",
+            len(failed),
+            len(checks),
+            ", ".join(c.name for c in failed),
         )
         return 0
 
@@ -273,8 +424,16 @@ def run(
             "skill_ci_low": gate.skill_ci[0],
             "skill_ci_high": gate.skill_ci[1],
             "matchup_only_brier": gate.cell_scores.brier,
-            "calibration_gap": gate.calibration_gap,
+            "calibration_ece": gate.calibration.ece,
+            "calibration_worst_gap": gate.calibration.worst_gap,
             "coin_brier": COIN_BRIER,
+            # The contract is judged on the pooled windows, so record what it saw.
+            "contract_calibration_ece": best.calibration.ece,
+            "contract_calibration_worst_gap": best.calibration.worst_gap,
+            "contract_calibration_worst_z": best.calibration.worst_z,
+            "contract_calibration_buckets": float(best.calibration.buckets),
+            "contract_eval_rows": float(best.model_scores.n),
+            "contract_windows": float(best.windows),
             # The selection windows, kept because a large gap between the two is the signal
             # that the sweep overfitted, and it is only visible if both are recorded.
             "selection_brier": best.model_scores.brier,

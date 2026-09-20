@@ -65,7 +65,7 @@ jobs:
       # exists (see notes/deployment_decision.md): a cache entry is immutable, so each run
       # restores the newest by prefix and saves a new one under the run id.
       - name: Restore the landing zone
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6.1.0
         with:
           path: data/landing
           key: landing-${{ github.run_id }}
@@ -75,23 +75,31 @@ jobs:
         # No secrets here on purpose: the tournament endpoints this stage uses are keyless,
         # so a scheduled run needs no credentials at all. Requiring one would make the job
         # fail for no reason. HOPSWORKS_* arrive when the feature-store write lands (MS2).
+        env:
+          # Through env, not interpolated into the shell. `${{ }}` substitutes before bash sees
+          # the line, so a free-text input would otherwise be able to inject script. These two
+          # are safe on a schedule — `||` uses truthiness and null is falsy, unlike `==` which
+          # coerces null to 0 and made the training workflow's promote flag misfire — but the
+          # injection risk is independent of that and worth closing here too.
+          BACKFILL_START: ${{ inputs.backfill_start }}
+          MIN_PLAYERS: ${{ inputs.min_players || 32 }}
         run: |
-          if [ -n "${{ inputs.backfill_start }}" ]; then
+          if [ -n "$BACKFILL_START" ]; then
             uv run python -m optcg_forecast.features.run \
-              --limit 400 --pages 5 --min-players "${{ inputs.min_players || 32 }}"
+              --limit 400 --pages 5 --min-players "$MIN_PLAYERS"
           else
-            uv run python -m optcg_forecast.features.run \
-              --min-players "${{ inputs.min_players || 32 }}"
+            uv run python -m optcg_forecast.features.run --min-players "$MIN_PLAYERS"
           fi
 
       - name: Save the landing zone
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6.1.0
         with:
           path: data/landing
           key: landing-${{ github.run_id }}
 
       - name: Report what the store holds
+        if: always()
         run: |
           echo "### Feature store" >> "$GITHUB_STEP_SUMMARY"
           uv run python -c "

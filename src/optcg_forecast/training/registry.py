@@ -31,14 +31,35 @@ CHAMPION = "champion"
 
 
 def _git_sha() -> str:
-    """Which commit produced this model. Unknown is fine; wrong is not."""
+    """Which commit produced this model. Unknown is fine; wrong is not.
+
+    The dirty check is the point. Recording a bare HEAD from a modified working tree names a
+    commit that did not produce the model, which is worse than recording nothing because it
+    looks reproducible. This has already happened once here: a card claimed a commit whose
+    successor, landed sixty seconds later, contained the code that actually made its numbers.
+    """
     try:
         out = subprocess.run(
             ["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5, check=True
         )
-        return out.stdout.strip()[:12]
+        sha = out.stdout.strip()[:12]
     except Exception:
         return "unknown"
+    try:
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"], capture_output=True, text=True, timeout=5, check=True
+        ).stdout.strip()
+    except Exception:
+        return sha
+    if dirty:
+        log.warning(
+            "working tree is dirty: this model cannot be reproduced from %s alone (%d changed "
+            "path(s))",
+            sha,
+            len(dirty.splitlines()),
+        )
+        return f"{sha}-dirty"
+    return sha
 
 
 @dataclass

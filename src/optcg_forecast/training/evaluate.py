@@ -116,6 +116,37 @@ def event_cluster_bootstrap(
 
 
 @dataclass(frozen=True)
+class Calibration:
+    """How well the probabilities mean what they say.
+
+    Three numbers, because one is not enough and the obvious one is the worst of the three.
+
+    `worst_gap` is a MAXIMUM over buckets, so its expected value grows with how many buckets
+    qualify. Simulated on this project's own pooled predictions, a perfectly calibrated model
+    clears 3 points 74% of the time and has a median worst gap of 3.4. As a pass/fail criterion
+    it therefore rejects a perfect model three times in four, which is a property of the
+    statistic, not of any model.
+
+    `ece` is the row-weighted mean gap - the standard expected calibration error. It does not
+    drift with bucket count and it is what should carry a threshold.
+
+    `worst_z` is the largest gap measured in its own standard errors, which is what actually
+    catches a bucket that is genuinely off rather than merely small.
+    """
+
+    ece: float
+    worst_gap: float
+    worst_z: float
+    buckets: int
+
+    def summary(self) -> str:
+        return (
+            f"ECE {self.ece:.2%}, worst gap {self.worst_gap:.2%} "
+            f"({self.worst_z:.1f} sigma) over {self.buckets} bucket(s)"
+        )
+
+
+@dataclass(frozen=True)
 class CalibrationBucket:
     """One slice of the reliability check."""
 
@@ -158,9 +189,49 @@ def calibration(
     return out
 
 
+def assess_calibration(
+    probs: Sequence[float], labels: Sequence[int], *, min_n: int = 250
+) -> Calibration:
+    """Summarise calibration over the buckets big enough to say anything."""
+    qualifying = [b for b in calibration(probs, labels) if b.n >= min_n]
+    if not qualifying:
+        # No evidence. Not "perfect" - the caller must be able to tell the difference, which is
+        # why buckets is returned and why the contract treats too few of them as a failure.
+        return Calibration(ece=0.0, worst_gap=0.0, worst_z=0.0, buckets=0)
+
+    total = sum(b.n for b in qualifying)
+    worst_z = 0.0
+    for b in qualifying:
+        se = math.sqrt(max(b.observed * (1.0 - b.observed), 1e-12) / b.n)
+        worst_z = max(worst_z, b.gap / se if se > 0 else 0.0)
+    return Calibration(
+        ece=sum(b.n * b.gap for b in qualifying) / total,
+        worst_gap=max(b.gap for b in qualifying),
+        worst_z=worst_z,
+        buckets=len(qualifying),
+    )
+
+
 def worst_calibration_gap(
     probs: Sequence[float], labels: Sequence[int], *, min_n: int = 250
-) -> float:
-    """Largest miscalibration among buckets with enough data to mean anything."""
-    gaps = [b.gap for b in calibration(probs, labels) if b.n >= min_n]
-    return max(gaps) if gaps else 0.0
+) -> tuple[float, int]:
+    """Largest miscalibration among buckets with enough data to mean anything.
+
+    Returns the gap AND how many buckets were big enough to contribute, because the two mean
+    nothing apart. This used to return a bare float and, when no bucket reached `min_n`, that
+    float was 0.0 - which reads as perfect calibration and is in fact no evidence at all. A
+    model whose predictions all pile into two thin buckets would have scored a flawless zero.
+
+    Failing open on a safety check is worse than not having the check, so the caller is now
+    handed the bucket count and has to decide what too few of them means.
+
+    Note also what this statistic is: a MAXIMUM over buckets, so it is biased upward by however
+    many buckets qualify. On a 2,454-row block with six qualifying buckets of roughly 300 rows
+    each, one-sigma noise is around 2.8 points and a perfectly calibrated model would routinely
+    show a worst gap above 3. Judge it on the pooled windows, where the buckets are four times
+    the size, not on the gate block.
+    """
+    qualifying = [b for b in calibration(probs, labels) if b.n >= min_n]
+    if not qualifying:
+        return 0.0, 0
+    return max(b.gap for b in qualifying), len(qualifying)
