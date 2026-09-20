@@ -101,16 +101,39 @@ class ModelRegistry:
 
     # ------------------------------------------------------------------ write
 
-    def register(self, model: Any, card: ModelCard) -> str:
-        """Store a model version. Immutable once written."""
+    def register(self, model: Any, card: ModelCard, gate_model: Any | None = None) -> str:
+        """Store a model version. Immutable once written.
+
+        Two models, not one, and the second is the interesting one.
+
+        `model` is refitted on the whole corpus and is what gets served - a model answering
+        tomorrow's questions should know about last week. That makes it useless for judging
+        against future data, because it has already seen the newest 28 days.
+
+        `gate_model` is the same settings fitted only on data up to the selection cutoff. It is
+        never served. It exists so that NEXT week's run can score this week's champion on a block
+        neither of them has seen, which is the only way a champion-versus-challenger comparison
+        means anything. Without it the comparison is between two numbers measured on different
+        fortnights of different metagames.
+        """
         target = self._version_dir(card.version)
         if target.exists():
             raise FileExistsError(f"{card.version} already exists; versions are immutable")
         target.mkdir(parents=True)
         (target / "model.pkl").write_bytes(pickle.dumps(model))
+        if gate_model is not None:
+            (target / "gate_model.pkl").write_bytes(pickle.dumps(gate_model))
         (target / "card.json").write_text(json.dumps(asdict(card), indent=1, default=str))
         log.info("registered %s", card.version)
         return card.version
+
+    def load_gate_model(self, ref: str = CHAMPION) -> Any | None:
+        """The un-refitted model, for comparisons against data it has not seen. None if absent."""
+        version = self.resolve(ref)
+        if version is None:
+            return None
+        path = self._version_dir(version) / "gate_model.pkl"
+        return pickle.loads(path.read_bytes()) if path.is_file() else None
 
     def set_alias(self, alias: str, version: str) -> None:
         """Point an alias at a version. This is what promotion actually is."""

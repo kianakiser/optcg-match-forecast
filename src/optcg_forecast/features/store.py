@@ -40,7 +40,12 @@ log = logging.getLogger(__name__)
 
 # Bump when a column's MEANING changes, not when one is added. Readers pin to a version, so an
 # old model can always be explained against the features it actually saw.
-FEATURE_SET_VERSION = "v1"
+# v2, 2026-09-20: events sharing a date are now emitted from one pre-date snapshot instead of
+# one at a time, so a later event on a date no longer trains on an earlier one. That changes the
+# VALUE of leader_strength_diff, player_strength_diff and cell_rate on 12,486 rows, which means a
+# v1 store and a v2 store built from the same landing zone disagree. The version has to move or a
+# model card saying "feature_set_version: v1" is ambiguous about which of the two it means.
+FEATURE_SET_VERSION = "v2"
 
 
 @dataclass

@@ -63,6 +63,8 @@ def read_landing(landing: Path) -> Iterator[tuple[date, list[Entrant], list[Matc
     """
     records = []
     for path in sorted(landing.rglob("*.json")):
+        if path.name.startswith("_"):
+            continue  # bookkeeping, by convention - see already_ingested()
         try:
             record = json.loads(path.read_text())
         except json.JSONDecodeError:
@@ -78,6 +80,7 @@ def read_landing(landing: Path) -> Iterator[tuple[date, list[Entrant], list[Matc
         records.append(record)
 
     records.sort(key=lambda r: (str(r["event_date"]), str(r["event_id"])))
+    _check_the_corpus_has_not_shrunk(landing, len(records))
     for record in records:
         event_date = date.fromisoformat(str(record["event_date"])[:10])
         yield (
@@ -85,6 +88,42 @@ def read_landing(landing: Path) -> Iterator[tuple[date, list[Entrant], list[Matc
             [_entrant(e) for e in record.get("entrants", [])],
             [_match(m) for m in record.get("matches", [])],
         )
+
+
+HIGH_WATER = "_high_water.json"
+
+
+def _check_the_corpus_has_not_shrunk(landing: Path, events: int) -> None:
+    """Shout if the landing zone has fewer events than it has ever had.
+
+    Events are immutable and ingest only ever adds, so the count is monotonic and a drop always
+    means something went wrong. The way it goes wrong in practice: the scheduled feature run
+    saves its cache with `if: always()`, so a run cancelled mid-ingest publishes a PARTIAL
+    landing zone under the newest key, and the training job restores by prefix and trains on
+    whatever it finds. Fewer events, a worse model, a green tick.
+
+    A warning rather than an error, because there is one legitimate way for the count to fall:
+    GitHub evicts caches after a week of inactivity, and a from-scratch re-ingest genuinely
+    starts small. That case is recoverable and common enough that failing would be wrong - but
+    it should never pass silently either.
+    """
+    marker = landing / HIGH_WATER
+    previous = 0
+    if marker.is_file():
+        try:
+            previous = int(json.loads(marker.read_text()).get("events", 0))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            log.warning("could not read %s; treating the corpus as new", marker)
+    if events < previous:
+        log.warning(
+            "THE LANDING ZONE SHRANK: %d events now, %d before. Events are immutable and ingest "
+            "only adds, so this is a partial restore (a cancelled ingest publishing its cache) "
+            "or a cache that was evicted and is refilling. Anything trained on this corpus is "
+            "trained on less than it should be.",
+            events,
+            previous,
+        )
+    marker.write_text(json.dumps({"events": max(events, previous)}))
 
 
 def materialise(

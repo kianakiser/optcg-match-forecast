@@ -12,9 +12,12 @@ name: Training pipeline
 
 on:
   schedule:
-    # Mondays 05:41 UTC. After the weekend's events have been ingested by the Sunday and Monday
-    # feature runs, and off the top of the hour where GitHub is most likely to skip a run.
-    - cron: "41 5 * * 1"
+    # Mondays 07:23 UTC — AFTER the 06:07 daily ingest, not before it. At 05:41 this job ran
+    # twenty-six minutes ahead of Monday's feature run and therefore always trained on Sunday's
+    # corpus, silently one day stale. The gap is deliberately wide because GitHub's cron is
+    # best-effort and the ingest can be delayed; if it is delayed past this, the run trains on
+    # the previous day's landing zone, which is correct-but-stale rather than wrong.
+    - cron: "23 7 * * 1"
   workflow_dispatch:
     inputs:
       promote:

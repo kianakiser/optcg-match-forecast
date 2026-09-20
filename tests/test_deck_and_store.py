@@ -222,3 +222,41 @@ def test_replace_all_refuses_to_empty_the_store(tmp_path):
     with pytest.raises(ValueError, match="refusing"):
         store.write([], replace_all=True)
     assert store.event_ids() == {"a"}
+
+
+# ------------------------------------------------ the landing zone must not shrink
+
+
+def test_a_shrinking_landing_zone_is_reported(tmp_path, caplog):
+    """A cancelled ingest publishes a partial cache; training then silently uses less data."""
+    from optcg_forecast.features.materialise import _check_the_corpus_has_not_shrunk
+
+    _check_the_corpus_has_not_shrunk(tmp_path, 277)
+    with caplog.at_level("WARNING"):
+        _check_the_corpus_has_not_shrunk(tmp_path, 120)
+    assert "SHRANK" in caplog.text
+    assert "277" in caplog.text and "120" in caplog.text
+
+
+def test_growth_is_silent_and_the_mark_rises(tmp_path, caplog):
+    from optcg_forecast.features.materialise import _check_the_corpus_has_not_shrunk
+
+    _check_the_corpus_has_not_shrunk(tmp_path, 100)
+    with caplog.at_level("WARNING"):
+        _check_the_corpus_has_not_shrunk(tmp_path, 277)
+    assert "SHRANK" not in caplog.text
+    # and the mark does not fall back after a dip
+    _check_the_corpus_has_not_shrunk(tmp_path, 50)
+    with caplog.at_level("WARNING"):
+        caplog.clear()
+        _check_the_corpus_has_not_shrunk(tmp_path, 200)
+    assert "SHRANK" in caplog.text, "the high-water mark must remember 277, not 50"
+
+
+def test_a_corrupt_marker_does_not_stop_the_rebuild(tmp_path, caplog):
+    from optcg_forecast.features.materialise import HIGH_WATER, _check_the_corpus_has_not_shrunk
+
+    (tmp_path / HIGH_WATER).write_text("not json at all")
+    with caplog.at_level("WARNING"):
+        _check_the_corpus_has_not_shrunk(tmp_path, 277)
+    assert "could not read" in caplog.text

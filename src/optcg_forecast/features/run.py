@@ -146,7 +146,13 @@ def write_landing(out_dir: Path, record: dict[str, Any]) -> Path:
 
 
 def already_ingested(out_dir: Path) -> set[str]:
-    return {p.stem for p in out_dir.rglob("*.json")}
+    """Event ids already on disk.
+
+    Leading underscore means bookkeeping, not an event - the shrink-detection marker lives in
+    this tree too. Without the filter its filename becomes an "ingested event id", which is
+    harmless right up until something trusts the set.
+    """
+    return {p.stem for p in out_dir.rglob("*.json") if not p.name.startswith("_")}
 
 
 def run(

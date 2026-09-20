@@ -364,8 +364,12 @@ def evaluate_block(
     train: Sequence[dict[str, Any]],
     test: Sequence[dict[str, Any]],
     params: dict[str, Any],
-) -> Evaluation:
-    """Train once and score one held-out block. Used for the final gate."""
+) -> tuple[Evaluation, HistGradientBoostingClassifier]:
+    """Train once and score one held-out block. Used for the final gate.
+
+    Returns the fitted model as well, because it is worth keeping: it has not seen the newest
+    28 days, so next week it can be scored on data that is genuinely new to it.
+    """
     assert_no_event_straddles(train, test)
     model = fit(train, params)
     probs = predict(model, test)
@@ -379,7 +383,7 @@ def evaluate_block(
         skill_ci=event_cluster_bootstrap(probs, labels, events, seed=SEED),
         calibration=assess_calibration(probs, labels),
         windows=1,
-    )
+    ), model
 
 
 def run(
@@ -423,7 +427,7 @@ def run(
     log.info("      %s", best.summary())
 
     # The final gate: the chosen settings, measured on data no candidate was selected against.
-    gate = evaluate_block(select_rows, holdout, best_params)
+    gate, gate_model = evaluate_block(select_rows, holdout, best_params)
     log.info("gate:  %s", gate.summary())
 
     checks = contract(best, gate)
@@ -440,14 +444,7 @@ def run(
         return 0
 
     registry = ModelRegistry(root=model_root)
-    incumbent = registry.card(CHAMPION)
-    if incumbent and incumbent.metrics.get("brier", 1.0) <= gate.model_scores.brier:
-        log.info(
-            "keeping champion %s (brier %.4f <= candidate %.4f)",
-            incumbent.version,
-            incumbent.metrics["brier"],
-            gate.model_scores.brier,
-        )
+    if not _challenger_wins(registry, holdout, gate.model_scores.brier):
         return 0
 
     # Refit on everything, including the held-out block. The gate has done its job by now, and a
@@ -505,12 +502,74 @@ def run(
         )
         return 0
 
-    registry.register(final_model, card)
+    registry.register(final_model, card, gate_model=gate_model)
     _copy_serving_state(store, registry, version, rows)
     if promote:
         registry.set_alias(CHAMPION, version)
         log.info("promoted %s to %s", version, CHAMPION)
     return 0
+
+
+def _challenger_wins(
+    registry: ModelRegistry, holdout: Sequence[dict[str, Any]], challenger_brier: float
+) -> bool:
+    """Compare challenger and champion on the SAME block, or not at all.
+
+    The version this replaces compared the challenger's Brier on this week's held-out block
+    against the number stored in the champion's card - which was measured on a different block,
+    a different fortnight, a different metagame. Two Briers from different populations are not
+    comparable, and the pipeline was making a promotion decision on the difference.
+
+    Re-scoring the champion's SERVED model here would be worse, because it was refitted on the
+    whole corpus and has already seen this block. So the comparison uses the champion's gate
+    model, which was fitted only up to its own selection cutoff. That cutoff is 28 days before
+    the champion's newest data, and this block starts 28 days before today's - so as long as the
+    champion is older than this block's start, it has never seen a row of it.
+
+    When that does not hold, or when the champion predates gate models entirely, no honest
+    comparison is available and we say so rather than inventing one. The absolute contract has
+    already been satisfied by that point, so promoting is defensible on its own terms.
+    """
+    incumbent = registry.card(CHAMPION)
+    if incumbent is None:
+        log.info("no champion yet, so nothing to beat")
+        return True
+
+    block_start = min(str(r["event_date"]) for r in holdout)
+    if incumbent.trained_through >= block_start:
+        log.warning(
+            "champion %s was trained through %s and this block starts %s, so it has seen part "
+            "of it. Skipping the comparison rather than reporting a leaked one; the absolute "
+            "contract still had to pass.",
+            incumbent.version,
+            incumbent.trained_through,
+            block_start,
+        )
+        return True
+
+    champion_gate = registry.load_gate_model(CHAMPION)
+    if champion_gate is None:
+        log.warning(
+            "champion %s has no gate model, so it cannot be scored on this block. Promoting on "
+            "the absolute contract alone. Versions registered from now on keep one.",
+            incumbent.version,
+        )
+        return True
+
+    labels = [int(r["label_p1_won"]) for r in holdout]
+    champion_brier = score(predict(champion_gate, holdout), labels).brier
+    log.info(
+        "champion %s scores %.4f on this block, challenger %.4f (same %d matches, neither "
+        "trained on them)",
+        incumbent.version,
+        champion_brier,
+        challenger_brier,
+        len(holdout),
+    )
+    if champion_brier <= challenger_brier:
+        log.info("keeping champion %s: retraining is not the same as improving", incumbent.version)
+        return False
+    return True
 
 
 def _copy_serving_state(

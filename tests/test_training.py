@@ -31,6 +31,7 @@ from optcg_forecast.training.run import (
     PILOT_FEATURES,
     SWAP,
     Evaluation,
+    _challenger_wins,
     _copy_serving_state,
     baseline_cell_rate,
     contract,
@@ -354,7 +355,7 @@ def test_the_gate_is_disjoint_from_the_selection_windows():
 def test_gate_evaluates_a_single_block():
     rows = make_rows()
     select_rows, holdout = final_holdout(rows)
-    gate = evaluate_block(select_rows, holdout, {"max_depth": 3, "max_iter": 50})
+    gate, _ = evaluate_block(select_rows, holdout, {"max_depth": 3, "max_iter": 50})
     assert gate.windows == 1
     assert gate.model_scores.n == len(holdout)
     assert gate.beats_coin
@@ -585,3 +586,73 @@ def _ev(deck: float, cell: float) -> Evaluation:
         calibration=Calibration(ece=0.01, worst_gap=0.02, worst_z=1.0, buckets=10),
         windows=6,
     )
+
+
+# ------------------------------------------------- champion versus challenger
+
+
+def _reg_with_champion(tmp_path, trained_through, gate_model=None, brier=0.24):
+    reg = ModelRegistry(root=tmp_path)
+    card = build_card(
+        version="v1",
+        feature_set_version="v2",
+        feature_names=FEATURES,
+        hyperparameters={"max_depth": 3},
+        metrics={"brier": brier},
+        training_rows=1000,
+        training_events=20,
+        trained_through=trained_through,
+    )
+    reg.register({"served": True}, card, gate_model=gate_model)
+    reg.set_alias(CHAMPION, "v1")
+    return reg
+
+
+def test_no_champion_means_nothing_to_beat(tmp_path):
+    assert _challenger_wins(ModelRegistry(root=tmp_path), [{"event_date": "2026-09-01"}], 0.24)
+
+
+def test_a_champion_that_has_seen_the_block_is_not_compared(tmp_path, caplog):
+    """Scoring it would leak; reporting a leaked number is worse than reporting none."""
+    rows = make_rows()
+    _, holdout = final_holdout(rows)
+    newest = max(str(r["event_date"]) for r in holdout)
+    reg = _reg_with_champion(tmp_path, trained_through=newest)
+    with caplog.at_level("WARNING"):
+        assert _challenger_wins(reg, holdout, 0.30)  # worse, but promoted anyway
+    assert "has seen part of it" in caplog.text
+
+
+def test_a_champion_without_a_gate_model_cannot_be_compared(tmp_path, caplog):
+    rows = make_rows()
+    _, holdout = final_holdout(rows)
+    reg = _reg_with_champion(tmp_path, trained_through="2020-01-01", gate_model=None)
+    with caplog.at_level("WARNING"):
+        assert _challenger_wins(reg, holdout, 0.30)
+    assert "no gate model" in caplog.text
+
+
+def test_a_better_champion_is_kept(tmp_path):
+    """Retraining weekly must not mean replacing weekly."""
+    rows = make_rows()
+    train, holdout = final_holdout(rows)
+    strong = fit(train, {"max_depth": 3, "learning_rate": 0.1, "max_iter": 80})
+    reg = _reg_with_champion(tmp_path, trained_through="2020-01-01", gate_model=strong)
+    assert not _challenger_wins(reg, holdout, 0.4999), "a far worse challenger must not promote"
+
+
+def test_a_better_challenger_wins(tmp_path):
+    rows = make_rows()
+    train, holdout = final_holdout(rows)
+    weak = fit(train[:200], {"max_depth": 1, "max_iter": 5})
+    reg = _reg_with_champion(tmp_path, trained_through="2020-01-01", gate_model=weak)
+    labels = [int(r["label_p1_won"]) for r in holdout]
+    champion_brier = score(predict(weak, holdout), labels).brier
+    assert _challenger_wins(reg, holdout, champion_brier - 0.01)
+
+
+def test_the_gate_model_is_stored_separately_from_the_served_one(tmp_path):
+    """They must not be the same object: one has seen the newest 28 days and one has not."""
+    reg = _reg_with_champion(tmp_path, trained_through="2020-01-01", gate_model={"gate": True})
+    assert reg.load(CHAMPION)[0] == {"served": True}
+    assert reg.load_gate_model(CHAMPION) == {"gate": True}

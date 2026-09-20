@@ -12,7 +12,7 @@ interval on that includes 50, so quoting it would be baseline-shopping: claiming
 that may not exist.
 
 *Confidence intervals cluster by event.* Matches inside one tournament share players, meta and
-conditions, so they are not independent observations. Treating 28,942 matches as 28,942 independent
+conditions, so they are not independent observations. Treating 68,320 matches as 68,320 independent
 samples makes every interval far too narrow and invites claiming significance that is not there.
 The effective sample size is closer to the number of events.
 """
