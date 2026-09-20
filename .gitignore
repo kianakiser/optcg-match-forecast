@@ -109,5 +109,8 @@ desktop.ini
 #                     explicit: "never commit reviews or drafts to your repo."
 #   course_exercises/ a clone of the lecturer's exercise repo, which he will make private
 #                     again after the lecture. Not ours to redistribute.
+# Scratch: extracted text and page renders of the course PDFs. Working material for me,
+# not for the graded repository — the course's own material does not belong in a public repo.
+/tmp/
 /notes/
 /course_exercises/
