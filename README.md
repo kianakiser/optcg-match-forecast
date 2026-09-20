@@ -42,15 +42,18 @@ position is not distinguishable from a coin flip and carries no free signal.
 28-day windows (≥ 8,000 matches), with the 95% event-cluster bootstrap CI on the skill excluding
 zero — plus calibration within 3 pp in every 5-pp favourite bucket with n ≥ 250.
 
-**Current champion (`v1`, trained 2026-09-20).** Pooled over 6 held-out 28-day windows and 12,700
-out-of-time matches: Brier **0.2325**, accuracy **60.98%**, skill **+0.0175** with an event-cluster
-CI of **[+0.0152, +0.0202]**, worst calibration gap **1.7%**. It clears the criterion on every
-term.
+**Current champion (`v1`, promoted 2026-09-20).** Promoted on a 2,456-match block held back
+before any model was fitted, so no candidate was selected against it: Brier **0.2368**, accuracy
+**59.53%**, skill **+0.0132** with an event-cluster CI of **[+0.0074, +0.0203]**, worst calibration
+gap **3.1%**.
 
 The comparison that matters is not against the coin flip but against the plain archetype matchup
-rate, which scores **0.2449** on the same matches. The model beats the simple thing it replaces,
-and the pipeline refuses to register a candidate that does not — see
+rate, which scores **0.2466** on the same block. The model beats the simple thing it replaces, and
+the pipeline refuses to register a candidate that does not — see
 [`training/run.py`](src/optcg_forecast/training/run.py).
+
+The six rolling windows used to *choose* the hyperparameters report 0.2315. The card records both,
+because the 0.0053 gap between them is the cost of selection and is only visible if both are kept.
 
 ## Data
 

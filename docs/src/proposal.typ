@@ -68,9 +68,11 @@ registered, and the pipeline refuses to register one that does not.
 Success = pooled over ≥ 6 held-out 28-day windows *split by event date, never by row*
 (≥ 8,000 matches): Brier ≤ 0.2490, below the matchup-rate baseline, with the skill interval
 (0.2500 − Brier, whole-event bootstrap) excluding zero, and calibration gaps ≤ 3 points in every
-5-point favourite bucket with n ≥ 250. The champion registered on 2026-09-20 reaches Brier 0.2325
-(skill interval +0.0152 to +0.0202) at 60.98% accuracy over 12,700 out-of-time matches, with a
-worst calibration gap of 1.7%.
+5-point favourite bucket with n ≥ 250. Hyperparameters are chosen on the rolling windows and the
+decision to promote is taken on a further block held back before any model is fitted, so nothing
+is selected against the number reported. The champion promoted on 2026-09-20 reaches Brier 0.2368
+(skill interval +0.0074 to +0.0203) at 59.53% accuracy on that block, against 0.2466 for the
+matchup rate, with a worst calibration gap of 3.1%.
 
 = 2 Originality & motivation
 

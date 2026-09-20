@@ -160,6 +160,26 @@ def evaluate_rolling(
     )
 
 
+def evaluate_block(
+    train: Sequence[dict[str, Any]],
+    test: Sequence[dict[str, Any]],
+    params: dict[str, Any],
+) -> Evaluation:
+    """Train once and score one held-out block. Used for the final gate."""
+    assert_no_event_straddles(train, test)
+    model = fit(train, params)
+    probs = predict(model, test)
+    labels = [int(r["label_p1_won"]) for r in test]
+    events = [str(r["event_id"]) for r in test]
+    return Evaluation(
+        model_scores=score(probs, labels),
+        cell_scores=score(baseline_cell_rate(test), labels),
+        skill_ci=event_cluster_bootstrap(probs, labels, events, seed=SEED),
+        calibration_gap=worst_calibration_gap(probs, labels),
+        windows=1,
+    )
+
+
 def run(
     *, feature_root: Path, model_root: Path, max_windows: int, promote: bool, dry_run: bool
 ) -> int:
@@ -170,11 +190,23 @@ def run(
         return 1
     log.info("%d feature rows from %d events", len(rows), len({r["event_id"] for r in rows}))
 
+    # The most recent 28 days are set aside before anything is fitted or chosen. Selecting
+    # hyperparameters on the rolling windows and then reporting those same windows as the
+    # result would be selection on the test set - mild here, with five candidates, but the
+    # whole point of this pipeline is not doing the mild version of that either.
+    select_rows, holdout = final_holdout(rows)
+    log.info(
+        "selecting on %d rows to %s; %d rows held back as the final gate",
+        len(select_rows),
+        max(str(r["event_date"]) for r in select_rows),
+        len(holdout),
+    )
+
     log.info("sweeping %d candidate settings", len(SWEEP))
     results: list[tuple[dict[str, Any], Evaluation]] = []
     for i, params in enumerate(SWEEP, 1):
         log.info("[%d/%d] %s", i, len(SWEEP), params)
-        ev = evaluate_rolling(rows, params, max_windows=max_windows)
+        ev = evaluate_rolling(select_rows, params, max_windows=max_windows)
         if ev is None:
             continue
         log.info("      %s", ev.summary())
@@ -188,35 +220,44 @@ def run(
     log.info("best: %s", best_params)
     log.info("      %s", best.summary())
 
-    # The honest checks, in order of how much they matter.
-    if not best.beats_coin:
+    # The final gate: the chosen settings, measured on data no candidate was selected against.
+    gate = evaluate_block(select_rows, holdout, best_params)
+    log.info("gate:  %s", gate.summary())
+
+    # The honest checks, in order of how much they matter. All are applied to the gate rather
+    # than to the selection windows, because the selection windows helped choose the winner.
+    if not gate.beats_coin:
         log.warning(
-            "REJECTED: skill interval [%+.4f, %+.4f] includes zero — no evidence of skill",
-            *best.skill_ci,
+            "REJECTED: held-out skill interval [%+.4f, %+.4f] includes zero — no evidence of "
+            "skill on data the sweep never saw",
+            *gate.skill_ci,
         )
         return 0
-    if not best.beats_cell_baseline:
+    if not gate.beats_cell_baseline:
         log.warning(
-            "REJECTED: the classifier (%.4f) does not beat the plain matchup rate (%.4f). "
-            "Register the simpler thing and say so.",
-            best.model_scores.brier,
-            best.cell_scores.brier,
+            "REJECTED: the classifier (%.4f) does not beat the plain matchup rate (%.4f) on the "
+            "held-out block. Register the simpler thing and say so.",
+            gate.model_scores.brier,
+            gate.cell_scores.brier,
         )
         return 0
 
     registry = ModelRegistry(root=model_root)
     incumbent = registry.card(CHAMPION)
-    if incumbent and incumbent.metrics.get("brier", 1.0) <= best.model_scores.brier:
+    if incumbent and incumbent.metrics.get("brier", 1.0) <= gate.model_scores.brier:
         log.info(
             "keeping champion %s (brier %.4f <= candidate %.4f)",
             incumbent.version,
             incumbent.metrics["brier"],
-            best.model_scores.brier,
+            gate.model_scores.brier,
         )
         return 0
 
-    train_rows, holdout = final_holdout(rows)
-    final_model = fit(train_rows, best_params)
+    # Refit on everything, including the held-out block. The gate has done its job by now, and a
+    # model that serves tomorrow's matches should know about last week's — deploying one
+    # deliberately blind to the most recent 28 days would throw away the freshest evidence about
+    # a metagame that moves.
+    final_model = fit(rows, best_params)
     version = registry.next_version()
     card = build_card(
         version=version,
@@ -224,20 +265,29 @@ def run(
         feature_names=FEATURES,
         hyperparameters=best_params,
         metrics={
-            "brier": best.model_scores.brier,
-            "log_loss": best.model_scores.log_loss,
-            "accuracy": best.model_scores.accuracy,
-            "brier_skill": best.model_scores.brier_skill,
-            "skill_ci_low": best.skill_ci[0],
-            "skill_ci_high": best.skill_ci[1],
-            "matchup_only_brier": best.cell_scores.brier,
-            "calibration_gap": best.calibration_gap,
+            # The promotion decision was made on these.
+            "brier": gate.model_scores.brier,
+            "log_loss": gate.model_scores.log_loss,
+            "accuracy": gate.model_scores.accuracy,
+            "brier_skill": gate.model_scores.brier_skill,
+            "skill_ci_low": gate.skill_ci[0],
+            "skill_ci_high": gate.skill_ci[1],
+            "matchup_only_brier": gate.cell_scores.brier,
+            "calibration_gap": gate.calibration_gap,
             "coin_brier": COIN_BRIER,
+            # The selection windows, kept because a large gap between the two is the signal
+            # that the sweep overfitted, and it is only visible if both are recorded.
+            "selection_brier": best.model_scores.brier,
+            "selection_accuracy": best.model_scores.accuracy,
+            "selection_matchup_only_brier": best.cell_scores.brier,
         },
-        training_rows=len(train_rows),
-        training_events=len({r["event_id"] for r in train_rows}),
-        trained_through=str(max(str(r["event_date"]) for r in train_rows)),
-        notes=f"held out {len(holdout)} rows; {best.windows} rolling windows",
+        training_rows=len(rows),
+        training_events=len({r["event_id"] for r in rows}),
+        trained_through=str(max(str(r["event_date"]) for r in rows)),
+        notes=(
+            f"selected on {best.windows} rolling windows over {len(select_rows)} rows; "
+            f"gated on {len(holdout)} held-out rows; refitted on all {len(rows)}"
+        ),
     )
 
     if dry_run:

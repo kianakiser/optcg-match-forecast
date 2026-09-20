@@ -24,9 +24,11 @@ from optcg_forecast.training.run import (
     FEATURES,
     Evaluation,
     baseline_cell_rate,
+    evaluate_block,
     evaluate_rolling,
     fit,
     predict,
+    run,
     to_matrix,
 )
 from optcg_forecast.training.split import (
@@ -277,3 +279,64 @@ def test_next_version_increments_past_ten(tmp_path):
         reg.register({"m": i}, _card(f"v{i}"))
     assert reg.next_version() == "v12"
     assert reg.versions()[-1] == "v11"
+
+
+# ------------------------------------------------------------------- the gate
+
+
+def test_the_gate_is_disjoint_from_the_selection_windows():
+    """The point of the final block: nothing selected on it, so it can judge the selection."""
+    rows = make_rows()
+    select_rows, holdout = final_holdout(rows)
+    select_events = {r["event_id"] for r in select_rows}
+    holdout_events = {r["event_id"] for r in holdout}
+    assert holdout_events
+    assert not (select_events & holdout_events)
+
+    for w in rolling_origin(select_rows, max_windows=4, min_train_rows=100, min_test_rows=50):
+        assert not ({r["event_id"] for r in w.test} & holdout_events)
+
+
+def test_gate_evaluates_a_single_block():
+    rows = make_rows()
+    select_rows, holdout = final_holdout(rows)
+    gate = evaluate_block(select_rows, holdout, {"max_depth": 3, "max_iter": 50})
+    assert gate.windows == 1
+    assert gate.model_scores.n == len(holdout)
+    assert gate.beats_coin
+
+
+def test_a_model_with_no_signal_is_refused(tmp_path, monkeypatch, caplog):
+    """The outcome that matters most: noise in, nothing registered, and said out loud."""
+    import random
+
+    import optcg_forecast.training.run as train_run
+
+    rng = random.Random(1)
+    noise = make_rows(n_events=50)  # past the pipeline's minimum-corpus guard
+    for row in noise:
+        row["label_p1_won"] = int(rng.random() < 0.5)  # label unrelated to every feature
+
+    class FakeStore:
+        def __init__(self, **_):
+            pass
+
+        def read(self):
+            return noise
+
+    monkeypatch.setattr(train_run, "FeatureStore", FakeStore)
+    monkeypatch.setattr(train_run, "SWEEP", [{"max_depth": 3, "max_iter": 50}])
+
+    with caplog.at_level("WARNING"):
+        assert (
+            run(
+                feature_root=tmp_path,
+                model_root=tmp_path / "models",
+                max_windows=3,
+                promote=True,
+                dry_run=False,
+            )
+            == 0
+        )
+    assert "REJECTED" in caplog.text
+    assert not (tmp_path / "models" / "versions").exists()
