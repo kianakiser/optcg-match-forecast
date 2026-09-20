@@ -185,3 +185,39 @@ def test_pipelines_do_not_import_from_notebooks() -> None:
         if re.search(r"^\s*(from|import)\s+.*notebooks", path.read_text(errors="ignore"), re.M)
     ]
     assert not offenders, f"pipeline code imports from notebooks: {offenders}"
+
+
+# --------------------------------------------------------------------------- working area
+
+NEVER_PUBLISH = ("notes/", "course_exercises/")
+
+
+@pytest.mark.parametrize("prefix", NEVER_PUBLISH)
+def test_local_working_area_is_never_tracked(prefix: str) -> None:
+    """notes/ and course_exercises/ live in the repo folder but must never be published.
+
+    notes/ holds peer-review drafts, and the Review Guide is explicit: "never commit reviews
+    or drafts to your repo". course_exercises/ is the lecturer's material, which he said he
+    will make private again after the lecture.
+
+    .gitignore covers both, but `git add -f` bypasses it, so this asserts the outcome rather
+    than trusting the mechanism.
+    """
+    tracked = [f for f in tracked_files() if f.startswith(prefix)]
+    assert not tracked, (
+        f"{prefix} must never be committed; found {len(tracked)} file(s): {tracked[:5]}"
+    )
+
+
+@pytest.mark.parametrize("prefix", NEVER_PUBLISH)
+def test_local_working_area_is_absent_from_history(prefix: str) -> None:
+    """Also check it was never committed and later removed — the rule is about the history too."""
+    out = subprocess.run(
+        ["git", "log", "--all", "--diff-filter=A", "--name-only", "--format="],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    ever = {line for line in out.stdout.splitlines() if line.startswith(prefix)}
+    assert not ever, f"{prefix} appears in git history: {sorted(ever)[:5]}"

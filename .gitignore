@@ -101,3 +101,13 @@ desktop.ini
 *.mov
 *.avi
 *.mkv
+
+# ---- Local working area — NEVER published ----
+# These live inside the repo folder so everything Claude produces sits in one place,
+# but they are deliberately never tracked:
+#   notes/            study notes, planning, and PEER-REVIEW DRAFTS. The Review Guide is
+#                     explicit: "never commit reviews or drafts to your repo."
+#   course_exercises/ a clone of the lecturer's exercise repo, which he will make private
+#                     again after the lecture. Not ours to redistribute.
+/notes/
+/course_exercises/
