@@ -39,7 +39,14 @@ concurrency:
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Generous because a cold backfill is rate-limit bound, not CPU bound: two years of events
+    # at 50 requests per 5 minutes is over an hour of mostly waiting. A daily run finishes in
+    # about a minute and never approaches this.
+    #
+    # A backfill that runs out of time is not a problem to solve. Ingest skips what the landing
+    # zone already holds and the cache is saved even when the job is cancelled, so the next
+    # dispatch resumes exactly where this one stopped. Idempotency turns a timeout into a pause.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7.0.1
 

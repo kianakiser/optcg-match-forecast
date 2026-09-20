@@ -62,6 +62,8 @@ jobs:
           key: landing-${{ github.run_id }}
           restore-keys: landing-
 
+      # Fails loudly on an empty landing zone rather than training on nothing. If this is the
+      # first run, dispatch the feature pipeline with a backfill value first.
       - name: Rebuild the feature store
         run: uv run python -m optcg_forecast.features.materialise
 
