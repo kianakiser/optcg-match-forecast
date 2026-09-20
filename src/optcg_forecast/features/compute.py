@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
+from optcg_forecast.features.cards import Card
+from optcg_forecast.features.deck import DeckSummary, summarise
 from optcg_forecast.features.ingest import Entrant, Match
 
 # An archetype needs some history before its strength estimate means anything. Below this we
@@ -69,6 +71,17 @@ class FeatureRow:
     player_strength_diff: float
     cell_rate: float
     experience_diff: float
+
+    # Deck contents. Two players can bring the same leader and different decks - measured,
+    # about 23% of the variation in counter count is between decks sharing a leader - so
+    # leader identity alone would call them identical. These are differences like the rest.
+    counter_2k_diff: float
+    avg_cost_diff: float
+    high_curve_diff: float
+    big_body_diff: float
+    event_copies_diff: float
+    trigger_copies_diff: float
+    deck_features_usable: bool
 
     # Coverage, carried as features AND surfaced to the caller. The model can learn to
     # distrust thin evidence; the service can refuse to answer on no evidence.
@@ -123,8 +136,18 @@ class FeatureBuilder:
         wins = rec.wins if key[0] == p1 else rec.games - rec.wins
         return (wins + 0.5 * PRIOR_GAMES) / (rec.games + PRIOR_GAMES), rec.games
 
-    def features_for(self, match: Match, p1_leader: str, p2_leader: str) -> FeatureRow:
+    def features_for(
+        self,
+        match: Match,
+        p1_leader: str,
+        p2_leader: str,
+        p1_deck: DeckSummary | None = None,
+        p2_deck: DeckSummary | None = None,
+    ) -> FeatureRow:
         """Emit one row from state as it stands BEFORE this match's event."""
+        d1 = p1_deck or DeckSummary()
+        d2 = p2_deck or DeckSummary()
+        deck_ok = d1.is_usable and d2.is_usable
         l1, l2 = self.leaders.get(p1_leader, _Record()), self.leaders.get(p2_leader, _Record())
         u1, u2 = (
             self.players.get(match.player1, _Record()),
@@ -146,6 +169,13 @@ class FeatureBuilder:
             p2_leader_games=l2.games,
             cell_games=cell_games,
             coverage=_coverage(l1.games, l2.games, cell_games),
+            counter_2k_diff=float(d1.counter_2k_copies - d2.counter_2k_copies) if deck_ok else 0.0,
+            avg_cost_diff=(d1.avg_cost - d2.avg_cost) if deck_ok else 0.0,
+            high_curve_diff=float(d1.high_curve_copies - d2.high_curve_copies) if deck_ok else 0.0,
+            big_body_diff=float(d1.big_body_copies - d2.big_body_copies) if deck_ok else 0.0,
+            event_copies_diff=float(d1.event_copies - d2.event_copies) if deck_ok else 0.0,
+            trigger_copies_diff=float(d1.trigger_copies - d2.trigger_copies) if deck_ok else 0.0,
+            deck_features_usable=deck_ok,
             label_p1_won=int(match.player1_won),
         )
 
@@ -168,7 +198,11 @@ class FeatureBuilder:
         rec.wins += won if key[0] == p1_leader else 1 - won
 
     def process_event(
-        self, event_date: date, matches: Iterable[Match], leader_of: dict[str, str]
+        self,
+        event_date: date,
+        matches: Iterable[Match],
+        leader_of: dict[str, str],
+        deck_of: dict[str, DeckSummary] | None = None,
     ) -> list[FeatureRow]:
         """Emit rows for one whole event, then learn from all of it.
 
@@ -183,19 +217,36 @@ class FeatureBuilder:
         self._last_date = event_date
 
         usable = [m for m in matches if leader_of.get(m.player1) and leader_of.get(m.player2)]
-        rows = [self.features_for(m, leader_of[m.player1], leader_of[m.player2]) for m in usable]
+        decks = deck_of or {}
+        rows = [
+            self.features_for(
+                m,
+                leader_of[m.player1],
+                leader_of[m.player2],
+                decks.get(m.player1),
+                decks.get(m.player2),
+            )
+            for m in usable
+        ]
         for m in usable:
             self.learn(m, leader_of[m.player1], leader_of[m.player2])
         return rows
 
 
-def build(events: Iterable[tuple[date, list[Entrant], list[Match]]]) -> Iterator[FeatureRow]:
+def build(
+    events: Iterable[tuple[date, list[Entrant], list[Match]]],
+    catalogue: dict[str, Card] | None = None,
+) -> Iterator[FeatureRow]:
     """Walk events in date order and yield feature rows.
 
     `events` must be sorted by date; process_event raises if it is not, because silently
     accepting out-of-order events would reintroduce exactly the leakage this module prevents.
     """
     builder = FeatureBuilder()
+    cat = catalogue or {}
     for event_date, entrants, matches in events:
         leader_of = {e.player: e.leader_id for e in entrants if e.leader_id}
-        yield from builder.process_event(event_date, matches, leader_of)
+        deck_of = (
+            {e.player: summarise(e.decklist, cat) for e in entrants if e.decklist} if cat else {}
+        )
+        yield from builder.process_event(event_date, matches, leader_of, deck_of)
