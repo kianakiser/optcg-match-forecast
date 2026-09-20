@@ -1,0 +1,201 @@
+"""Turn ingested events into model-ready feature rows, point-in-time correctly.
+
+The whole design of this module exists to make one bug impossible.
+
+A feature for a match played on 3 March must be computed from what was known on 2 March. Get that
+wrong and the model learns from its own future: scores look excellent in development and collapse
+in production. It is the single most common way a project like this fails, and it fails silently.
+
+Rather than compute features and then try to prove no future leaked in, this does a single forward
+pass in date order. State is read to emit a row, and only updated *afterwards*, so a match can
+never see its own event - let alone a later one. Point-in-time correctness is then a property of
+the loop's shape rather than a rule someone has to remember.
+
+One consequence worth stating: every match inside an event sees the same snapshot, taken before the
+event began. That is deliberate. Updating within an event would let round 1 results inform round 4
+features, which is exactly the in-event leakage the `table` field was rejected for.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
+from datetime import date
+from typing import Any
+
+from optcg_forecast.features.ingest import Entrant, Match
+
+# An archetype needs some history before its strength estimate means anything. Below this we
+# say so through the coverage flag rather than pretending. 40 is where the measured accuracy
+# stops improving steeply; it is a knob, not a law.
+MIN_GAMES_FOR_STRENGTH = 40
+
+# Shrinkage: an archetype at 3-0 is not a 100% deck. Pull rates toward 0.5 by pretending we
+# also saw PRIOR_GAMES coin flips. Larger = more sceptical of thin evidence.
+PRIOR_GAMES = 20.0
+
+# A pairing needs this many games before its head-to-head rate is worth more than the two
+# individual strengths.
+MIN_GAMES_FOR_CELL = 12
+
+
+@dataclass
+class _Record:
+    """Wins and games for one archetype or player, as known so far."""
+
+    games: int = 0
+    wins: int = 0
+
+    @property
+    def shrunk_rate(self) -> float:
+        """Win rate pulled toward 0.5, so thin evidence cannot shout."""
+        return (self.wins + 0.5 * PRIOR_GAMES) / (self.games + PRIOR_GAMES)
+
+
+@dataclass
+class FeatureRow:
+    """One match, ready for the model. Every field known before the event started."""
+
+    event_id: str
+    event_date: date
+    round: int
+    p1_leader: str
+    p2_leader: str
+
+    # Differences, not levels: the model must not be able to learn "seat 1 is better",
+    # because it is not - seat 1 wins 50.56%, which is a coin flip.
+    leader_strength_diff: float
+    player_strength_diff: float
+    cell_rate: float
+    experience_diff: float
+
+    # Coverage, carried as features AND surfaced to the caller. The model can learn to
+    # distrust thin evidence; the service can refuse to answer on no evidence.
+    p1_leader_games: int
+    p2_leader_games: int
+    cell_games: int
+    coverage: str
+
+    label_p1_won: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return dict(vars(self))
+
+
+def _coverage(p1_games: int, p2_games: int, cell_games: int) -> str:
+    """How much evidence stands behind this row.
+
+    Measured on the backfill: `solid` scores ~0.2445 Brier, `thin` ~0.2477, `prior_only`
+    ~0.2486, and `cold` is genuinely uninformative - a leader-attribute backoff was measured
+    at 0.2513, worse than a coin flip, which is why cold returns 0.5 rather than guessing.
+    """
+    if cell_games >= MIN_GAMES_FOR_CELL:
+        return "solid"
+    if min(p1_games, p2_games) >= MIN_GAMES_FOR_STRENGTH:
+        return "prior_only"
+    if cell_games > 0 or max(p1_games, p2_games) >= MIN_GAMES_FOR_STRENGTH:
+        return "thin"
+    return "cold"
+
+
+@dataclass
+class FeatureBuilder:
+    """Walks events in date order, emitting rows then learning from them."""
+
+    leaders: dict[str, _Record] = field(default_factory=lambda: defaultdict(_Record))
+    players: dict[str, _Record] = field(default_factory=lambda: defaultdict(_Record))
+    cells: dict[tuple[str, str], _Record] = field(default_factory=lambda: defaultdict(_Record))
+    _last_date: date | None = None
+
+    @staticmethod
+    def _key(a: str, b: str) -> tuple[str, str]:
+        """Order-independent pairing key, so A-vs-B and B-vs-A share evidence."""
+        return (a, b) if a <= b else (b, a)
+
+    def _cell_rate_for(self, p1: str, p2: str) -> tuple[float, int]:
+        """Head-to-head rate from p1's perspective, shrunk toward 0.5."""
+        key = self._key(p1, p2)
+        rec = self.cells.get(key)
+        if rec is None or rec.games == 0:
+            return 0.5, 0
+        # cells store wins for the lexicographically first archetype
+        wins = rec.wins if key[0] == p1 else rec.games - rec.wins
+        return (wins + 0.5 * PRIOR_GAMES) / (rec.games + PRIOR_GAMES), rec.games
+
+    def features_for(self, match: Match, p1_leader: str, p2_leader: str) -> FeatureRow:
+        """Emit one row from state as it stands BEFORE this match's event."""
+        l1, l2 = self.leaders.get(p1_leader, _Record()), self.leaders.get(p2_leader, _Record())
+        u1, u2 = (
+            self.players.get(match.player1, _Record()),
+            self.players.get(match.player2, _Record()),
+        )
+        cell_rate, cell_games = self._cell_rate_for(p1_leader, p2_leader)
+
+        return FeatureRow(
+            event_id=match.event_id,
+            event_date=match.event_date,
+            round=match.round,
+            p1_leader=p1_leader,
+            p2_leader=p2_leader,
+            leader_strength_diff=l1.shrunk_rate - l2.shrunk_rate,
+            player_strength_diff=u1.shrunk_rate - u2.shrunk_rate,
+            cell_rate=cell_rate,
+            experience_diff=float(u1.games - u2.games),
+            p1_leader_games=l1.games,
+            p2_leader_games=l2.games,
+            cell_games=cell_games,
+            coverage=_coverage(l1.games, l2.games, cell_games),
+            label_p1_won=int(match.player1_won),
+        )
+
+    def learn(self, match: Match, p1_leader: str, p2_leader: str) -> None:
+        """Fold one finished match into state. Only ever called after features are emitted."""
+        won = match.player1_won
+        self.leaders[p1_leader].games += 1
+        self.leaders[p1_leader].wins += won
+        self.leaders[p2_leader].games += 1
+        self.leaders[p2_leader].wins += 1 - won
+        self.players[match.player1].games += 1
+        self.players[match.player1].wins += won
+        self.players[match.player2].games += 1
+        self.players[match.player2].wins += 1 - won
+
+        key = self._key(p1_leader, p2_leader)
+        rec = self.cells[key]
+        rec.games += 1
+        # store wins for the lexicographically first archetype, so the key stays symmetric
+        rec.wins += won if key[0] == p1_leader else 1 - won
+
+    def process_event(
+        self, event_date: date, matches: Iterable[Match], leader_of: dict[str, str]
+    ) -> list[FeatureRow]:
+        """Emit rows for one whole event, then learn from all of it.
+
+        Two phases on purpose: emitting first means no match in this event can see any other
+        match in the same event.
+        """
+        if self._last_date is not None and event_date < self._last_date:
+            raise ValueError(
+                f"events must arrive in date order for point-in-time correctness: "
+                f"{event_date} came after {self._last_date}"
+            )
+        self._last_date = event_date
+
+        usable = [m for m in matches if leader_of.get(m.player1) and leader_of.get(m.player2)]
+        rows = [self.features_for(m, leader_of[m.player1], leader_of[m.player2]) for m in usable]
+        for m in usable:
+            self.learn(m, leader_of[m.player1], leader_of[m.player2])
+        return rows
+
+
+def build(events: Iterable[tuple[date, list[Entrant], list[Match]]]) -> Iterator[FeatureRow]:
+    """Walk events in date order and yield feature rows.
+
+    `events` must be sorted by date; process_event raises if it is not, because silently
+    accepting out-of-order events would reintroduce exactly the leakage this module prevents.
+    """
+    builder = FeatureBuilder()
+    for event_date, entrants, matches in events:
+        leader_of = {e.player: e.leader_id for e in entrants if e.leader_id}
+        yield from builder.process_event(event_date, matches, leader_of)
