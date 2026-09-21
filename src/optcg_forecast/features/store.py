@@ -53,6 +53,12 @@ class FeatureStore:
     """Versioned, partitioned Parquet on a local or mounted path."""
 
     root: Path = Path("data/features")
+
+    def __post_init__(self) -> None:
+        # A str is the obvious thing to pass and fails later, inside a path join, with a
+        # TypeError that names neither the argument nor the caller. Coerce and move on.
+        self.root = Path(self.root)
+
     version: str = FEATURE_SET_VERSION
 
     @property

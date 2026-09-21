@@ -656,3 +656,9 @@ def test_the_gate_model_is_stored_separately_from_the_served_one(tmp_path):
     reg = _reg_with_champion(tmp_path, trained_through="2020-01-01", gate_model={"gate": True})
     assert reg.load(CHAMPION)[0] == {"served": True}
     assert reg.load_gate_model(CHAMPION) == {"gate": True}
+
+
+def test_a_string_model_root_is_accepted(tmp_path):
+    reg = ModelRegistry(root=str(tmp_path))
+    reg.register({"m": 1}, _card("v1"))
+    assert reg.versions() == ["v1"]

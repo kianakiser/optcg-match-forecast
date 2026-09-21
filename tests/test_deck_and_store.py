@@ -261,3 +261,10 @@ def test_a_corrupt_marker_does_not_stop_the_rebuild(tmp_path, caplog):
     with caplog.at_level("WARNING"):
         _check_the_corpus_has_not_shrunk(tmp_path, 277)
     assert "could not read" in caplog.text
+
+
+def test_a_string_root_is_accepted(tmp_path):
+    """A str is the obvious thing to pass and used to fail deep inside a path join."""
+    store = FeatureStore(root=str(tmp_path))
+    store.write([row("e1", date(2026, 3, 1))])
+    assert store.event_ids() == {"e1"}
